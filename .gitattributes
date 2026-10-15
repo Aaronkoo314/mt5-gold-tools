@@ -1,0 +1,5 @@
+# MQL5 sources: keep them as they are (MetaEditor reads CRLF and LF)
+*.mq5 -text
+*.mqh -text
+# MT5 presets are UTF-16: store as binary so git does not change them
+*.set binary

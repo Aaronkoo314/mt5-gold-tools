@@ -1,0 +1,18 @@
+# levels.csv for ApplyLevels (Alt+L) and TradeBot ("套用 levels").
+# Copy to MQL5/Files/levels.csv and fill in the signal you entered on. Example values only.
+side=sell
+created=2026.01.05 16:24     # PC local time when written (refused when older than max_age_min)
+sl=2370
+tp1=2356
+tp2=2351
+tp3=2346
+zone_lo=2360        # positions entered outside zone_lo-zone_tol .. zone_hi+zone_tol are left alone (both 0 = off)
+zone_hi=2365
+zone_tol=3
+tp1_share=0.25      # worst entries get TP1
+tp2_share=0.45      # next ones get TP2, the best entries get TP3
+max_risk_pct=20     # warn if the loss at all stops is above this % of balance
+max_age_min=30      # refuse a file older than this
+min_sl_gap=2        # refuse if the SL is closer than this to the price (catches typos)
+max_sl_dist=20      # refuse if the SL is further than this from the average entry
+confirm=1           # 1 = preview window before applying (ApplyLevels)

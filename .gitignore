@@ -1,0 +1,19 @@
+# compiled MQL5 and MetaEditor output
+*.ex5
+*.ex4
+*.log
+
+# live files: they hold the current signal / plan
+MQL5/Files/levels.csv
+MQL5/Files/gameplan.csv
+MQL5/Files/gameplans/
+
+# Python
+__pycache__/
+*.pyc
+
+# editors and OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

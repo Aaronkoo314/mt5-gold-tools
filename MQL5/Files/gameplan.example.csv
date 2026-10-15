@@ -1,0 +1,6 @@
+# kind;low;high;label;tooltip   (kind: buy, buy_mid, sell, sell_mid, pivot, buy_line, sell_line; high=0 draws a line)
+# Copy to MQL5/Files/gameplan.csv. Example values only.
+buy;2300.5;2312.5;OB 2300.5-2312.5  buys;Buys at the order block
+sell_line;2280;0;Break of 2280 - sells;Sells if price breaks this low
+sell;2394.5;2401.5;Resistance 2394.5-2401.5  sells;Sells at resistance
+sell_mid;2453.5;2464.5;SBR + OB 2453.5-2464.5  medium-risk sells;Medium-risk sells
