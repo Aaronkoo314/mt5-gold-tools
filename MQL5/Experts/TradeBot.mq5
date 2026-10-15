@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| TradeBot.mq5  (v1.20)                                            |
+//| TradeBot.mq5  (v1.21)                                            |
 //| Telegram trade-management bot for the open positions of one      |
 //| symbol (default: this chart's) on a hedging account. Buttons in  |
 //| your private Telegram chat: breakeven, close 25/50/75 %, derisk, |
@@ -37,7 +37,7 @@
 //|    read after a gap in the connection longer than InpMaxCmdAgeS  |
 //|    or that Telegram says are too old                             |
 //+------------------------------------------------------------------+
-#property version     "1.20"
+#property version     "1.21"
 #property description "Telegram buttons: breakeven, close 25/50/75%, derisk, close all, levels.csv, status"
 
 #include <Trade\Trade.mqh>
@@ -55,6 +55,7 @@ input int    InpConfirmS   = 30;    // Close all / derisk / levels: confirm with
 #define LONGPOLL 10                 // seconds Telegram may hold a getUpdates request open
 
 string   g_sym = "";
+string   g_token = "";             // InpBotToken without spaces, quotes or a leading "bot"
 string   g_lock = "";              // terminal global variable: one TradeBot per token
 long     g_lockKey = 0;
 long     g_offset = 0;
@@ -98,6 +99,48 @@ bool TradingAllowed()
   }
 
 string LastErr() { return(StringFormat("%u %s", trade.ResultRetcode(), trade.ResultRetcodeDescription())); }
+
+// The token as Telegram expects it ("123456789:AAx..."): spaces, line breaks, quotes and a leading
+// "bot" that come with a copy and paste are removed. Returns "" and the reason (never the token) if the
+// format is wrong.
+string CleanToken(const string raw, string &why)
+  {
+   string t = "";
+   for(int i = 0; i < StringLen(raw); i++)
+     {
+      ushort c = StringGetCharacter(raw, i);
+      if(c > ' ' && c != '"' && c != '\'' && c != '<' && c != '>' && c != 0x200B && c != 0xFEFF && c != 0xA0)
+         t += ShortToString(c);
+     }
+   if(t == "")
+     { why = "put your bot token in InpBotToken (from @BotFather)"; return(""); }
+   string low = t;
+   StringToLower(low);
+   if(StringFind(low, "bot") == 0 && StringLen(t) > 3 && StringGetCharacter(t, 3) >= '0' && StringGetCharacter(t, 3) <= '9')
+      t = StringSubstr(t, 3);
+   int colon = StringFind(t, ":");
+   if(colon <= 0)
+     { why = StringFormat("bot token format is wrong: no ':' (%d characters). It looks like 123456789:AAH... - copy it again from @BotFather", StringLen(t)); return(""); }
+   for(int i = 0; i < colon; i++)
+     {
+      ushort c = StringGetCharacter(t, i);
+      if(c < '0' || c > '9')
+        { why = "bot token format is wrong: the part before ':' must be digits only - copy it again from @BotFather"; return(""); }
+     }
+   int tail = StringLen(t) - colon - 1;
+   for(int i = colon + 1; i < StringLen(t); i++)
+     {
+      ushort c = StringGetCharacter(t, i);
+      if(!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '-'))
+        { why = "bot token format is wrong: a character after ':' is not a letter, digit, '_' or '-' - copy it again from @BotFather"; return(""); }
+     }
+   if(tail < 30)
+     { why = StringFormat("bot token looks cut off: %d characters after ':' (normally 35) - copy all of it from @BotFather", tail); return(""); }
+   if(t != InpBotToken)
+      Print("TradeBot: removed spaces, quotes or a leading 'bot' from the token you pasted");
+   why = "";
+   return(t);
+  }
 
 // the server refused the request, so nothing was executed and one more try is safe
 bool Refused(const uint rc)
@@ -263,8 +306,8 @@ long ObjId(const string js, const string key, const int from)
 string TokenHash()
   {
    uint h = 5381;
-   for(int i = 0; i < StringLen(InpBotToken); i++)
-      h = h * 33 + StringGetCharacter(InpBotToken, i);
+   for(int i = 0; i < StringLen(g_token); i++)
+      h = h * 33 + StringGetCharacter(g_token, i);
    return(IntegerToString(h));
   }
 
@@ -313,7 +356,7 @@ int TgCall(const string method, const string body, string &resp, const int timeo
       ArrayResize(data, ArraySize(data) - 1);          // drop the trailing 0
      }
    ResetLastError();
-   int code = WebRequest(body != "" ? "POST" : "GET", TG_URL + InpBotToken + "/" + method,
+   int code = WebRequest(body != "" ? "POST" : "GET", TG_URL + g_token + "/" + method,
                          "Content-Type: application/json\r\n", timeoutMs, data, result, rh);
    resp = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
    if(code == -1)
@@ -323,7 +366,7 @@ int TgCall(const string method, const string body, string &resp, const int timeo
                        : StringFormat("no connection to Telegram (error %d)", e));
      }
    else if(code == 401 || code == 404)
-      Status("Telegram rejected the bot token - check InpBotToken");
+      Status(StringFormat("Telegram rejected the bot token (HTTP %d) - copy it again: @BotFather > /mybots > your bot > API Token", code));
    else if(code == 409)
       Status("another program is reading this bot (webhook or a second TradeBot) - commands are not read");
    return(code);
@@ -1332,9 +1375,11 @@ int OnInit()
    // a random start, so buttons of an earlier run (or of another TradeBot) never match
    MathSrand(GetTickCount() ^ (uint)TimeLocal() ^ (uint)ChartID());
    g_seq = 100000000 + (int)((((uint)MathRand() << 15) | (uint)MathRand()) % 900000000);
-   if(InpBotToken == "")
+   string why = "";
+   g_token = CleanToken(InpBotToken, why);
+   if(g_token == "")
      {
-      Status("put your bot token in InpBotToken (from @BotFather)");
+      Status(why);
       return(INIT_SUCCEEDED);
      }
    // the newest keyboard of an earlier run: its buttons are removed when the first menu is sent
@@ -1361,7 +1406,7 @@ void OnDeinit(const int reason)
 
 void OnTimer()
   {
-   if(InpBotToken == "")
+   if(g_token == "")
       return;
    if(g_pending != "" && TimeLocal() - g_pendingT > InpConfirmS)
       g_pending = "";
