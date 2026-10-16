@@ -17,6 +17,7 @@ FILES = [
     "MQL5/Scripts/CloseAll.mq5",
     "MQL5/Scripts/GamePlanZones.mq5",
     "MQL5/Presets/NewsGuard_NFP.set",
+    "MQL5/Presets/NewsGuard_SL80_BE40.set",
 ]
 
 

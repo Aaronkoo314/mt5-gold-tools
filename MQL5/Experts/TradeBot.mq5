@@ -1,5 +1,5 @@
-//+------------------------------------------------------------------+
-//| TradeBot.mq5  (v1.21)                                            |
+﻿//+------------------------------------------------------------------+
+//| TradeBot.mq5  (v1.31)                                            |
 //| Telegram trade-management bot for the open positions of one      |
 //| symbol (default: this chart's) on a hedging account. Buttons in  |
 //| your private Telegram chat: breakeven, close 25/50/75 %, derisk, |
@@ -32,12 +32,16 @@
 //|  - close all / derisk / levels need a second tap (confirm)       |
 //|  - only the buttons of the newest bot message act; older buttons |
 //|    and a second tap on the same message do nothing               |
+//|  - a signal pasted or forwarded to the bot ("Gold sell zone      |
+//|    4154-4159 SL 4164 TP1 4150 TP2 4145 TP3 4140") is written to  |
+//|    levels.csv and shown with the levels plan; a forwarded        |
+//|    message is only ever read as a signal, never as a command     |
 //|  - skipped: commands sent before the EA started, typed commands  |
-//|    older than InpMaxCmdAgeS, forwarded messages, button taps     |
-//|    read after a gap in the connection longer than InpMaxCmdAgeS  |
-//|    or that Telegram says are too old                             |
+//|    older than InpMaxCmdAgeS, button taps read after a gap in the |
+//|    connection longer than InpMaxCmdAgeS or that Telegram says    |
+//|    are too old, forwarded signals older than SIG_MAX_POST_MIN    |
 //+------------------------------------------------------------------+
-#property version     "1.21"
+#property version     "1.31"
 #property description "Telegram buttons: breakeven, close 25/50/75%, derisk, close all, levels.csv, status"
 
 #include <Trade\Trade.mqh>
@@ -71,6 +75,7 @@ bool     g_kbOk = true;            // the newest keyboard reached Telegram
 bool     g_pollKb = false;         // a keyboard was delivered while handling this poll
 uint     g_lastOk = 0;             // end of the last good getUpdates (GetTickCount)
 bool     g_conflict = false;       // another reader of this bot was reported
+bool     g_lvNoPos = false;        // the last DoLevels refused only because no position of that side is open
 string   g_unsent = "";            // results that did not reach Telegram
 int      g_unsentTries = 0;
 CTrade   trade;
@@ -264,11 +269,24 @@ string JVal(const string js, const string key, const int from)
            {
             ushort e = StringGetCharacter(js, i + 1);
             if(e == 'n') out += "\n";
+            else if(e == 't') out += "\t";
+            else if(e == 'r') out += "\r";
+            else if(e == 'b' || e == 'f') out += " ";
             else if(e == 'u' && i + 5 < n)
               {
-               ushort u = (ushort)StringToInteger("0x" + StringSubstr(js, i + 2, 4));
-               out += ShortToString(u);
-               i += 4;
+               int u = 0;
+               for(int q = 2; q < 6; q++)              // 4 hex digits (no reliance on StringToInteger("0x.."))
+                 {
+                  ushort h = StringGetCharacter(js, i + q);
+                  int d = (h >= '0' && h <= '9') ? h - '0' : (h >= 'a' && h <= 'f') ? h - 'a' + 10 : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+                  if(d < 0) { u = -1; break; }
+                  u = u * 16 + d;
+                 }
+               if(u >= 0)
+                 {
+                  out += ShortToString((ushort)u);
+                  i += 4;
+                 }
               }
             else out += ShortToString(e);
             i += 2;
@@ -956,6 +974,7 @@ bool LvLoad(LvConfig &c, string &err)
 bool DoLevels(const bool apply, const string expectFp, string &txt, string &fp)
   {
    fp = "";
+   g_lvNoPos = false;
    if(StringFind(g_sym, "XAU") != 0 && StringFind(g_sym, "GOLD") < 0)
      { txt = "levels 只用于黄金，现在管理的是 " + g_sym; return(false); }
    LvConfig c;
@@ -991,7 +1010,7 @@ bool DoLevels(const bool apply, const string expectFp, string &txt, string &fp)
       ArrayResize(sel, n + 1); sel[n] = ps[i]; n++;
      }
    if(n == 0)
-     { txt = StringFormat("没有%s单%s。没有改动。", isBuy ? "买" : "卖", outside > 0 ? "在区间里" : ""); return(false); }
+     { g_lvNoPos = true; txt = StringFormat("没有%s单%s。没有改动。", isBuy ? "买" : "卖", outside > 0 ? "在区间里" : ""); return(false); }
    double avgEntry = 0, totVol = 0;
    for(int i = 0; i < n; i++) { avgEntry += sel[i].op * sel[i].vol; totVol += sel[i].vol; }
    avgEntry /= totVol;
@@ -1157,20 +1176,560 @@ void AskConfirm(const long chat, const string cmd)
      }
   }
 
+//+------------------------------------------------------------------+
+//| signals pasted or forwarded in Telegram -> levels.csv            |
+//| Format: "Gold sell zone 4154-4159 SL 4164 TP1 4150 TP2 4145 TP3  |
+//| 4140" (direction word optional: the SL side decides). Typos are  |
+//| repaired against the live price: one common shift of 100 / 200 / |
+//| 1000 for the numbers far from the price, else a one-edit repair  |
+//| (one digit changed, swapped, added or removed) that lands where  |
+//| he usually puts that level. Every repair is shown to the user.   |
+//| A signal that is valid as written is not repaired. When all six  |
+//| numbers are far, only a forward at most 10 min old is shifted.   |
+//| Tested on 163 of his past signals: 134 read as written; 23       |
+//| repaired and 6 refused (forward <= 10 min old) or 17 repaired    |
+//| and 12 refused (pasted or older); no GP post read as a signal.   |
+//+------------------------------------------------------------------+
+#define SIG_FAR             60.0    // a number further than this from the price is a typo
+#define LV_MAX_AGE_MIN      30      // levels.csv older than this is refused (max_age_min); counted from writing
+#define SIG_MAX_POST_MIN    120     // a forwarded signal posted longer ago than this is not written
+#define SIG_WHOLE_SHIFT_MIN 10      // all six numbers may be repaired by one shift only for a forward this fresh
+
+string Sub(const string s, const int start, const int len)  { return((len <= 0 || start >= StringLen(s)) ? "" : StringSubstr(s, start, len)); }
+string Tail(const string s, const int start)                { return(start >= StringLen(s) ? "" : StringSubstr(s, start)); }
+
+string g_sigName[6] = {"区间", "区间", "SL", "TP1", "TP2", "TP3"};
+
+bool IsDig(const ushort c) { return(c >= '0' && c <= '9'); }
+bool IsLet(const ushort c) { return((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')); }
+string Num(const double x) { return(StringFormat("%.7g", x)); }
+
+// number at i (digits with an optional .digits part): index after it, or -1
+int ReadNum(const string s, const int i, double &v, int &intDigits)
+  {
+   int n = StringLen(s), j = i;
+   while(j < n && IsDig(StringGetCharacter(s, j)))
+      j++;
+   if(j == i)
+      return(-1);
+   intDigits = j - i;
+   if(j + 1 < n && StringGetCharacter(s, j) == '.' && IsDig(StringGetCharacter(s, j + 1)))
+     {
+      j++;
+      while(j < n && IsDig(StringGetCharacter(s, j)))
+         j++;
+     }
+   v = StringToDouble(StringSubstr(s, i, j - i));
+   return(j);
+  }
+
+int SkipSep(const string s, int i)
+  {
+   int n = StringLen(s);
+   while(i < n)
+     {
+      ushort c = StringGetCharacter(s, i);
+      if(c != ' ' && c != ':' && c != '@' && c != '=' && c != '\n' && c != '\r' && c != '\t')
+         break;
+      i++;
+     }
+   return(i);
+  }
+
+bool PipsAfter(const string s, int i)
+  {
+   while(i < StringLen(s) && StringGetCharacter(s, i) == ' ')
+      i++;
+   return(StringSubstr(s, i, 3) == "pip");
+  }
+
+// position of w at or after 'from', not glued to other letters; -1 if none
+int FindWord(const string s, const string w, const int from)
+  {
+   int n = StringLen(s), L = StringLen(w);
+   for(int k = StringFind(s, w, from); k >= 0; k = StringFind(s, w, k + 1))
+     {
+      bool left  = (k == 0) || !IsLet(StringGetCharacter(s, k - 1));
+      bool right = (k + L >= n) || !IsLet(StringGetCharacter(s, k + L));
+      if(left && right)
+         return(k);
+     }
+   return(-1);
+  }
+
+void AddStr(string &a[], int &n, const string s)
+  {
+   ArrayResize(a, n + 1);
+   a[n++] = s;
+  }
+
+// numbers one edit away from x: one digit changed, two neighbours swapped, one digit added or removed
+int Edits(const double x, double &out[])
+  {
+   string s = StringFormat("%.10g", x);
+   int dot = StringFind(s, ".");
+   string ip = (dot < 0) ? s : StringSubstr(s, 0, dot);
+   string fp = (dot < 0) ? "" : StringSubstr(s, dot);
+   string c[];
+   int n = 0, L = StringLen(ip);
+   for(int i = 0; i < L; i++)
+     {
+      for(ushort d = '0'; d <= '9'; d++)
+         AddStr(c, n, Sub(ip, 0, i) + ShortToString(d) + Tail(ip, i + 1));
+      if(i + 1 < L)
+         AddStr(c, n, Sub(ip, 0, i) + Sub(ip, i + 1, 1) + Sub(ip, i, 1) + Tail(ip, i + 2));
+      AddStr(c, n, Sub(ip, 0, i) + Tail(ip, i + 1));
+     }
+   for(int i = 0; i <= L; i++)
+      for(ushort d = '0'; d <= '9'; d++)
+         AddStr(c, n, Sub(ip, 0, i) + ShortToString(d) + Tail(ip, i));
+   ArrayResize(out, 0);
+   int m = 0;
+   for(int k = 0; k < n; k++)
+     {
+      if(c[k] == "" || StringGetCharacter(c[k], 0) == '0')
+         continue;
+      double y = StringToDouble(c[k] + fp);
+      if(MathAbs(y - x) < 1e-9)
+         continue;
+      bool dup = false;
+      for(int q = 0; q < m && !dup; q++)
+         dup = MathAbs(out[q] - y) < 1e-9;
+      if(!dup)
+        {
+         ArrayResize(out, m + 1);
+         out[m++] = y;
+        }
+     }
+   return(m);
+  }
+
+// where he usually puts a level (k: 2 SL, 3-5 TP1-TP3), as distance from the zone; used only for repairs
+bool InWin(const int k, const double v, const int side, const double lo, const double hi)
+  {
+   double w0, w1;
+   if(k == 2)      { w0 = 2;  w1 = 10; }
+   else if(k == 3) { w0 = 2;  w1 = 7;  }
+   else if(k == 4) { w0 = 6;  w1 = 12; }
+   else if(k == 5) { w0 = 10; w1 = 20; }
+   else return(true);
+   double d = (k == 2) ? (side > 0 ? lo - v : v - hi) : (side > 0 ? v - hi : lo - v);
+   return(d >= w0 - 1e-9 && d <= w1 + 1e-9);
+  }
+
+// "" when v[] (zone a, zone b, SL, TP1-TP3) is a valid signal; side is set once the SL side is known.
+// strict[k]: v[k] must also sit where he usually puts it.
+string SigCheck(const double &v[], const int word, const bool &strict[], int &side)
+  {
+   double lo = MathMin(v[0], v[1]), hi = MathMax(v[0], v[1]), sl = v[2];
+   side = 0;
+   if(hi - lo <= 0 || hi - lo > 15)
+      return(StringFormat("区间 %s-%s 宽 %s（最多 15）", Num(v[0]), Num(v[1]), Num(hi - lo)));
+   int geo = (sl < lo) ? 1 : (sl > hi ? -1 : 0);
+   if(geo == 0)
+      return("SL " + Num(sl) + " 在区间里面");
+   if(word != 0 && word != geo)
+      return(StringFormat("写的是%s，但 SL %s 在%s单那一边", word > 0 ? "买" : "卖", Num(sl), geo > 0 ? "买" : "卖"));
+   side = geo;
+   if((side > 0 ? lo - sl : sl - hi) > 20)
+      return("SL " + Num(sl) + " 离区间超过 20");
+   for(int i = 0; i < 3; i++)
+     {
+      double x = v[3 + i];
+      bool ok = (side > 0) ? (x > hi - 5 && x < hi + 40) : (x > lo - 40 && x < lo + 5);
+      if(!ok)
+         return(StringFormat("TP%d %s 不在%s单的方向上", i + 1, Num(x), side > 0 ? "买" : "卖"));
+     }
+   if(!(side > 0 ? (v[3] < v[4] && v[4] < v[5]) : (v[3] > v[4] && v[4] > v[5])))
+      return("TP1、TP2、TP3 的顺序不对");
+   for(int k = 2; k < 6; k++)
+      if(strict[k] && !InWin(k, v[k], side, lo, hi))
+         return(g_sigName[k] + " " + Num(v[k]) + " 不在他平常的位置");
+   return("");
+  }
+
+// 0 = not a signal, 1 = only a direction, 2 = refused (why), 3 = ok (v[]: zone a, zone b, SL, TP1-TP3)
+// allowWhole: all six numbers far from the price may be repaired by one common shift (only for a fresh forward;
+// otherwise the signal may simply be old, and the would-be repair is only suggested).
+int ParseSignal(const string raw, const double price, const bool allowWhole, double &v[], int &side, string &fixes, string &why)
+  {
+   // one kind of space, dash, digit and colon: tabs, line breaks, no-break and wide spaces, dashes, full-width forms
+   string t = "";
+   for(int i = 0; i < StringLen(raw); i++)
+     {
+      ushort c = StringGetCharacter(raw, i);
+      if(c == '\t' || c == '\r' || c == '\n' || c == 0xA0 || (c >= 0x2000 && c <= 0x200A) || c == 0x202F || c == 0x3000)
+         c = ' ';
+      else if(c >= 0xFF10 && c <= 0xFF19)
+         c = (ushort)('0' + (c - 0xFF10));
+      else if(c == 0xFF1A)
+         c = ':';
+      else if(c == 0xFF0E)
+         c = '.';
+      else if(c == 0xFF0D || c == 0x2010 || c == 0x2011 || c == 0x2012 || c == 0x2013 || c == 0x2014 || c == 0x2212)
+         c = '-';
+      t += ShortToString(c);
+     }
+   StringToLower(t);
+   StringReplace(t, ",", " ");
+   int n = StringLen(t);
+   fixes = "";
+   why = "";
+   side = 0;
+   ArrayResize(v, 6);
+   // SL: the first "sl" / "stop loss" followed by a price (not by "pips")
+   int slAt = -1;
+   double sl = 0;
+   string kw[3] = {"sl", "stop loss", "stoploss"};
+   for(int q = 0; q < 3; q++)
+      for(int k = FindWord(t, kw[q], 0); k >= 0; k = FindWord(t, kw[q], k + 1))
+        {
+         double x;
+         int dg;
+         int e = ReadNum(t, SkipSep(t, k + StringLen(kw[q])), x, dg);
+         if(e < 0 || PipsAfter(t, e))
+            continue;
+         if(slAt < 0 || k < slAt) { slAt = k; sl = x; }
+         break;
+        }
+   // TPs: "tp1 4150", "tp 4150", in the order written
+   double tpv[];
+   int tpl[];
+   int nt = 0;
+   for(int k = FindWord(t, "tp", 0); k >= 0; k = FindWord(t, "tp", k + 1))
+     {
+      int i = k + 2;
+      while(i < n && StringGetCharacter(t, i) == ' ')
+         i++;
+      int label = 0;
+      if(i < n)
+        {
+         ushort c = StringGetCharacter(t, i);
+         ushort c2 = (i + 1 < n) ? StringGetCharacter(t, i + 1) : ' ';
+         int run = 0;
+         while(i + run < n && IsDig(StringGetCharacter(t, i + run)))
+            run++;
+         // "tp1 4150" (label, then the price) or "tp14150" (label glued to a 4-digit price)
+         if(c >= '1' && c <= '3' && ((!IsDig(c2) && c2 != '.') || run >= 5))
+           { label = c - '0'; i++; }
+        }
+      double x;
+      int dg;
+      int e = ReadNum(t, SkipSep(t, i), x, dg);
+      if(e < 0 || PipsAfter(t, e))
+         continue;
+      ArrayResize(tpv, nt + 1); ArrayResize(tpl, nt + 1);
+      tpv[nt] = x; tpl[nt] = label; nt++;
+     }
+   // zone: the first "a-b" of two prices (3-5 digits) before the SL
+   bool hasZone = false;
+   double za = 0, zb = 0;
+   int zEnd = (slAt >= 0) ? slAt : n;
+   for(int i = 0; i < zEnd && !hasZone; i++)
+     {
+      ushort c = StringGetCharacter(t, i);
+      if(!IsDig(c) || (i > 0 && (IsDig(StringGetCharacter(t, i - 1)) || StringGetCharacter(t, i - 1) == '.')))
+         continue;
+      double x, y;
+      int dg, dg2;
+      int e = ReadNum(t, i, x, dg);
+      if(e < 0 || dg < 3 || dg > 5)
+         continue;
+      int j = e;
+      while(j < n && StringGetCharacter(t, j) == ' ') j++;
+      if(j >= n || StringGetCharacter(t, j) != '-')
+         continue;
+      j++;
+      while(j < n && StringGetCharacter(t, j) == ' ') j++;
+      int e2 = ReadNum(t, j, y, dg2);
+      if(e2 < 0 || dg2 < 3 || dg2 > 5)
+         continue;
+      za = x; zb = y; hasZone = true;
+     }
+   int wb = FindWord(t, "buy", 0), ws = FindWord(t, "sell", 0);
+   int word = (wb >= 0 && (ws < 0 || wb < ws)) ? 1 : (ws >= 0 ? -1 : 0);
+   if(!hasZone || (slAt < 0 && nt < 3))
+     {
+      if(nt == 0 && slAt < 0 && word != 0 && (FindWord(t, "now", 0) >= 0 || FindWord(t, "zone", 0) >= 0))
+         return(1);
+      return(0);
+     }
+   if(slAt < 0) { why = "没有 SL"; return(2); }
+   if(nt < 3)   { why = "要有 TP1、TP2、TP3"; return(2); }
+   v[0] = za; v[1] = zb; v[2] = sl;
+   bool byLabel = (tpl[0] + tpl[1] + tpl[2] == 6 && tpl[0] * tpl[1] * tpl[2] == 6);   // labels 1, 2, 3 in any order
+   for(int i = 0; i < 3; i++)
+      v[byLabel ? 2 + tpl[i] : 3 + i] = tpv[i];
+
+   if(price <= 0)
+     {
+      why = "没有报价，没法核对喊单";
+      return(2);
+     }
+   // repairs: numbers far from the price
+   bool far[6], none[6];
+   bool anyFar = false;
+   int nFar = 0;
+   for(int k = 0; k < 6; k++)
+     {
+      far[k] = MathAbs(v[k] - price) > SIG_FAR;
+      none[k] = false;
+      anyFar = anyFar || far[k];
+      if(far[k]) nFar++;
+     }
+   if(anyFar && nFar < 6)
+     {
+      // valid as written (the price has moved, e.g. a re-forward): take the numbers as he wrote them
+      int sd0;
+      if(SigCheck(v, word, none, sd0) == "")
+         anyFar = false;
+     }
+   if(anyFar)
+     {
+      double shifts[6] = {100, -100, 200, -200, 1000, -1000};
+      bool done = false;
+      for(int q = 0; q < 6 && !done; q++)
+        {
+         double tr[6];
+         bool strict[6];
+         bool near = true;
+         for(int k = 0; k < 6; k++)
+           {
+            tr[k] = far[k] ? v[k] + shifts[q] : v[k];
+            strict[k] = far[k] && k >= 2;
+            near = near && MathAbs(tr[k] - price) <= SIG_FAR;
+           }
+         int sd;
+         if(near && SigCheck(tr, word, strict, sd) == "")
+           {
+            if(nFar == 6 && !allowWhole)
+              {
+               why = StringFormat("所有数字都离现价 %s 超过 $%.0f（喊单可能太旧）。如果是他把数字打错，可能是下面这条，核对后复制发给我：\n%s%s-%s SL %s TP1 %s TP2 %s TP3 %s",
+                                  Px(price), SIG_FAR, word > 0 ? "buy " : (word < 0 ? "sell " : ""), Num(MathMin(tr[0], tr[1])), Num(MathMax(tr[0], tr[1])),
+                                  Num(tr[2]), Num(tr[3]), Num(tr[4]), Num(tr[5]));
+               return(2);
+              }
+            for(int k = 0; k < 6; k++)
+               if(far[k])
+                 {
+                  fixes += g_sigName[k] + " " + Num(v[k]) + " → " + Num(tr[k]) + "；";
+                  v[k] = tr[k];
+                 }
+            if(nFar == 6)
+               fixes += "（所有数字都改了，请特别核对）；";
+            done = true;
+           }
+        }
+      if(!done && nFar == 6)
+        {
+         why = StringFormat("所有数字都离现价 %s 超过 $%.0f，喊单可能太旧或整条打错", Px(price), SIG_FAR);
+         return(2);
+        }
+      for(int k = 0; k < 6 && !done; k++)                // zone ends first, then SL, then TPs
+        {
+         if(!far[k])
+            continue;
+         double c[], keep[];
+         int m = Edits(v[k], c), nk = 0;
+         double lo = MathMin(v[0], v[1]), hi = MathMax(v[0], v[1]);
+         int sd = (word != 0) ? word : (v[2] < lo ? 1 : (v[2] > hi ? -1 : 0));
+         for(int q = 0; q < m; q++)
+           {
+            double y = c[q];
+            if(MathAbs(y - price) > SIG_FAR)
+               continue;
+            if(k <= 1)
+              {
+               double other = v[1 - k];
+               if(MathAbs(other - price) <= SIG_FAR && !(MathAbs(y - other) > 0 && MathAbs(y - other) <= 15))
+                  continue;
+              }
+            else if(sd == 0 ? !(InWin(k, y, 1, lo, hi) || InWin(k, y, -1, lo, hi)) : !InWin(k, y, sd, lo, hi))
+               continue;
+            ArrayResize(keep, nk + 1);
+            keep[nk++] = y;
+           }
+         if(nk != 1)
+           {
+            why = StringFormat("%s %s 看起来打错了（离现价 %s 超过 $%.0f），没法自动改正", g_sigName[k], Num(v[k]), Px(price), SIG_FAR);
+            return(2);
+           }
+         fixes += g_sigName[k] + " " + Num(v[k]) + " → " + Num(keep[0]) + "；";
+         v[k] = keep[0];
+        }
+     }
+   why = SigCheck(v, word, none, side);
+   if(StringFind(why, "TP") == 0 && side != 0)
+     {
+      // one TP on the wrong side or out of order although near the price: one-edit repair in its usual place
+      double lo = MathMin(v[0], v[1]), hi = MathMax(v[0], v[1]);
+      int bad = -1, nb = 0;
+      for(int k = 3; k < 6; k++)
+         if(!InWin(k, v[k], side, lo, hi)) { bad = k; nb++; }
+      if(nb == 1)
+        {
+         double c[];
+         int m = Edits(v[bad], c), nk = 0;
+         double y = 0;
+         for(int q = 0; q < m; q++)
+            if(InWin(bad, c[q], side, lo, hi)) { y = c[q]; nk++; }
+         if(nk == 1)
+           {
+            double tr[6];
+            ArrayCopy(tr, v);
+            tr[bad] = y;
+            int sd;
+            if(SigCheck(tr, word, none, sd) == "")
+              {
+               fixes += g_sigName[bad] + " " + Num(v[bad]) + " → " + Num(y) + "；";
+               v[bad] = y;
+               why = SigCheck(v, word, none, side);
+              }
+           }
+        }
+     }
+   return(why == "" ? 3 : 2);
+  }
+
+bool WriteLevels(const int side, const double &v[], const datetime created, string &err)
+  {
+   ResetLastError();
+   int h = FileOpen("levels.csv", FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_SHARE_READ);
+   if(h == INVALID_HANDLE)
+     {
+      err = StringFormat("打不开 MQL5/Files/levels.csv（错误 %d）", GetLastError());
+      return(false);
+     }
+   int dg = (int)SymbolInfoInteger(g_sym, SYMBOL_DIGITS);
+   FileWriteString(h, "# written by TradeBot from a Telegram message at " + TimeToString(TimeLocal(), TIME_DATE | TIME_MINUTES) + "\n");
+   FileWriteString(h, "side=" + (side > 0 ? "buy" : "sell") + "\n");
+   FileWriteString(h, "created=" + TimeToString(created, TIME_DATE | TIME_MINUTES) + "\n");
+   FileWriteString(h, "sl=" + DoubleToString(v[2], dg) + "\n");
+   FileWriteString(h, "tp1=" + DoubleToString(v[3], dg) + "\n");
+   FileWriteString(h, "tp2=" + DoubleToString(v[4], dg) + "\n");
+   FileWriteString(h, "tp3=" + DoubleToString(v[5], dg) + "\n");
+   FileWriteString(h, "zone_lo=" + DoubleToString(MathMin(v[0], v[1]), dg) + "\n");
+   FileWriteString(h, "zone_hi=" + DoubleToString(MathMax(v[0], v[1]), dg) + "\n");
+   FileWriteString(h, "zone_tol=3\ntp1_share=0.25\ntp2_share=0.45\nmax_risk_pct=20\n");
+   FileWriteString(h, StringFormat("max_age_min=%d\nmin_sl_gap=2\nmax_sl_dist=20\nconfirm=1\n", LV_MAX_AGE_MIN));
+   FileClose(h);
+   return(true);
+  }
+
+// A signal pasted or forwarded in Telegram: write levels.csv, then show the levels plan with the confirm
+// button (or say to tap 套用 levels after entering). origin: when it was first posted (unix time, 0 = now).
+// Returns false when the text is not a signal and was not forwarded (the caller then shows the menu).
+bool TrySignal(const long chat, const string text, const long origin, const bool fwd)
+  {
+   // notes must not make a waiting confirm button stale (a menu would): e.g. a signal and its reasons forwarded together
+   string kbNote = (g_pending != "" && TimeLocal() - g_pendingT <= InpConfirmS) ? "" : "menu";
+   long age = -1;                                         // seconds since he posted it; -1 = unknown (typed or pasted)
+   if(fwd)
+     {
+      if(origin <= 0)
+        {
+         TgSend(chat, "不知道这条转发的消息是什么时候发的，没有写 levels。请复制原文发给我。", kbNote);
+         return(true);
+        }
+      age = MathMax(0, (long)TimeGMT() - origin);
+     }
+   MqlTick tk;
+   double price = SymbolInfoTick(g_sym, tk) ? (tk.bid + tk.ask) / 2 : 0;
+   double v[];
+   int side = 0;
+   string fixes = "", why = "";
+   bool whole = (age >= 0 && age <= SIG_WHOLE_SHIFT_MIN * 60);
+   int r = ParseSignal(text, price, whole, v, side, fixes, why);
+   if(r == 0)
+     {
+      if(!fwd)
+         return(false);
+      TgSend(chat, "这条不是喊单：要有区间（例如 4154-4159）、SL 和 TP1–TP3。转发的消息只用来识别喊单，不会执行别的操作。", kbNote);
+      return(true);
+     }
+   if(r == 1)
+     {
+      TgSend(chat, "这条只有方向。等他发区间、SL、TP 的那条，再转发给我。", kbNote);
+      return(true);
+     }
+   if(age > SIG_MAX_POST_MIN * 60)
+     {
+      TgSend(chat, StringFormat("这条喊单是 %d 分钟前发的（超过 %d 分钟），没有写 levels。", (int)(age / 60), SIG_MAX_POST_MIN), kbNote);
+      return(true);
+     }
+   if(r == 2)
+     {
+      bool editable = StringFind(why, "发给我") < 0 && StringFind(why, "没有报价") < 0;
+      TgSend(chat, "没有写 levels：" + why + (editable ? "。\n可以复制原文，改好后发给我。" : ""), kbNote);
+      PrintFormat("TradeBot: signal refused: %s", why);
+      return(true);
+     }
+   if(StringFind(g_sym, "XAU") != 0 && StringFind(g_sym, "GOLD") < 0)
+     {
+      TgSend(chat, "levels 只用于黄金，现在管理的是 " + g_sym + "。", kbNote);
+      return(true);
+     }
+   datetime created = TimeLocal();                         // the 30-minute window for 套用 levels starts now
+   string err = "";
+   if(!WriteLevels(side, v, created, err))
+     {
+      TgSend(chat, "写 levels.csv 失败：" + err, kbNote);
+      return(true);
+     }
+   double lo = MathMin(v[0], v[1]), hi = MathMax(v[0], v[1]);
+   string head = StringFormat("已记下喊单：%s %s–%s，SL %s，TP1 %s / TP2 %s / TP3 %s%s。levels.csv 已更新。",
+                              side > 0 ? "买" : "卖", Num(lo), Num(hi), Num(v[2]), Num(v[3]), Num(v[4]), Num(v[5]),
+                              age >= 0 ? "（他 " + TimeToString(TimeLocal() - (datetime)age, TIME_MINUTES) + " 发的）" : "");
+   if(fixes != "")
+      head += "\n注意：原文有数字看起来打错了，已按现价改正：" + fixes + "请对照原文核对。";
+   PrintFormat("TradeBot: signal %s %s-%s SL %s TP %s/%s/%s%s", side > 0 ? "buy" : "sell", Num(lo), Num(hi),
+               Num(v[2]), Num(v[3]), Num(v[4]), Num(v[5]), fixes != "" ? " (repaired: " + fixes + ")" : "");
+   string t = "", fp = "";
+   g_pending = "";
+   if(DoLevels(false, "", t, fp))
+     {
+      if(TgSend(chat, head + "\n\n" + t, "confirm:levels"))
+        {
+         g_pending = "levels";
+         g_pendingT = TimeLocal();
+         g_pendingFp = fp;
+        }
+     }
+   else if(g_lvNoPos)
+      TgSend(chat, head + "\n\n" + t + StringFormat("\n进场后在 %s 前点「套用 levels」（30 分钟内）。过了时间，再转发一次同一条喊单（他发出后 %d 分钟内都可以）。",
+                                                  TimeToString(created + LV_MAX_AGE_MIN * 60, TIME_MINUTES), SIG_MAX_POST_MIN), "menu");
+   else
+      TgSend(chat, head + "\n\n" + t, "menu");
+   return(true);
+  }
+
 // raw: typed text or button data ("p50:<keyboard id>"); stale: read after a gap in the connection
 void Handle(const long chat, const string raw, const string cbId, const bool stale)
   {
    string cmd = raw;
    StringTrimLeft(cmd); StringTrimRight(cmd); StringToLower(cmd);
-   if(StringGetCharacter(cmd, 0) == '/') cmd = StringSubstr(cmd, 1);
-   int at = StringFind(cmd, "@");
-   if(at > 0) cmd = StringSubstr(cmd, 0, at);
    long seqIn = -1;
-   int colon = StringFind(cmd, ":");
-   if(colon > 0)
+   if(cbId != "")
      {
-      seqIn = StringToInteger(StringSubstr(cmd, colon + 1));
-      cmd = StringSubstr(cmd, 0, colon);
+      // button data: "<cmd>:<keyboard id>"
+      int colon = StringFind(cmd, ":");
+      if(colon > 0)
+        {
+         seqIn = StringToInteger(StringSubstr(cmd, colon + 1));
+         cmd = StringSubstr(cmd, 0, colon);
+        }
+     }
+   else
+     {
+      // typed: only an exact command - "p50", "/p50" or "/p50@botname"; text with more in it is not a command
+      if(StringGetCharacter(cmd, 0) == '/')
+        {
+         cmd = StringSubstr(cmd, 1);
+         int at = StringFind(cmd, "@");
+         if(at > 0) cmd = StringSubstr(cmd, 0, at);
+        }
+      if(StringFind(cmd, " ") >= 0 || StringFind(cmd, ":") >= 0 || StringFind(cmd, "\n") >= 0 || StringFind(cmd, "@") >= 0)
+         cmd = "";
      }
    bool isOk = StringFind(cmd, "ok_") == 0;
    bool action = IsAction(cmd) || isOk;
@@ -1233,7 +1792,9 @@ void Handle(const long chat, const string raw, const string cbId, const bool sta
       Execute(chat, cmd, "");
       return;
      }
-   TgSend(chat, "TradeBot（" + g_sym + "，账户 " + Acct() + "）：选一个操作。", "menu");
+   if(cbId == "" && TrySignal(chat, raw, 0, false))
+      return;                                          // a pasted signal
+   TgSend(chat, "TradeBot（" + g_sym + "，账户 " + Acct() + "）：选一个操作。也可以把他的喊单转发给我。", "menu");
   }
 
 void Poll()
@@ -1284,8 +1845,9 @@ void Poll()
          continue;
         }
       if(uid >= g_offset) g_offset = uid + 1;
-      long chat = 0, from = 0;
+      long chat = 0, from = 0, origin = 0;
       string text = "", cbId = "";
+      bool fwd = false;
       int cq = TopKey(up, "callback_query", 0);
       if(cq >= 0)
         {
@@ -1300,16 +1862,24 @@ void Poll()
         {
          int ms = TopKey(up, "message", 0);
          if(ms < 0) continue;
-         if(TopKey(up, "forward_origin", ms) >= 0 || TopKey(up, "forward_date", ms) >= 0 ||
-            TopKey(up, "via_bot", ms) >= 0 || TopKey(up, "is_automatic_forward", ms) >= 0)
+         if(TopKey(up, "via_bot", ms) >= 0)
            {
-            Print("TradeBot: ignored a forwarded message");
+            Print("TradeBot: ignored a message sent via a bot");
             continue;
            }
+         // a forwarded message is only read as a signal (never as a command); origin = when it was first posted
+         int fo = TopKey(up, "forward_origin", ms), fd = TopKey(up, "forward_date", ms);
+         fwd = (fo >= 0 || fd >= 0 || TopKey(up, "is_automatic_forward", ms) >= 0);
+         if(fo >= 0)
+            origin = StringToInteger(JVal(up, "date", TopKey(up, "date", fo)));
+         else if(fd >= 0)
+            origin = StringToInteger(JVal(up, "forward_date", fd));
          from = ObjId(up, "from", ms);
          chat = ObjId(up, "chat", ms);
          long date = StringToInteger(JVal(up, "date", TopKey(up, "date", ms)));
          text = JVal(up, "text", TopKey(up, "text", ms));
+         if(text == "")
+            text = JVal(up, "caption", TopKey(up, "caption", ms));   // a signal posted with a picture
          if(date > 0 && (long)TimeGMT() - date > InpMaxCmdAgeS)
            {
             PrintFormat("TradeBot: ignored an old message (%d s)", (int)((long)TimeGMT() - date));
@@ -1329,7 +1899,10 @@ void Poll()
          if(cbId != "") TgAnswer(cbId, "没有权限");
          continue;
         }
-      Handle(chat, text, cbId, gap);
+      if(fwd)
+         TrySignal(chat, text, origin, true);
+      else
+         Handle(chat, text, cbId, gap);
      }
    if(!g_primed)
      {
