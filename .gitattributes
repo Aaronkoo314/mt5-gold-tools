@@ -3,3 +3,6 @@
 *.mqh -text
 # MT5 presets are UTF-16: store as binary so git does not change them
 *.set binary
+# chart templates and terminal ini files are UTF-16: binary
+*.tpl binary
+*.ini binary
