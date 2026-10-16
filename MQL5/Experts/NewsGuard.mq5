@@ -9,7 +9,7 @@
 //|  3. alerts when more positions are open than the layer limit     |
 //| It never opens trades and never loosens an existing stop.        |
 //+------------------------------------------------------------------+
-#property version     "1.10"
+#property version     "1.20"
 #property description "Auto stop loss + auto breakeven for open positions on this symbol."
 
 #include <Trade\Trade.mqh>
@@ -86,9 +86,23 @@ void Modify(const ulong ticket, const string sym, const double sl, const double 
       return;
    double tpNow = tp;
    if(PositionSelectByTicket(ticket))
+     {
       tpNow = PositionGetDouble(POSITION_TP);   // keep a TP that another tool set a moment ago
+      // another tool (TradeBot's automatic levels) may have set a stop a moment ago: never replace it
+      double slNow = PositionGetDouble(POSITION_SL), pt = SymbolInfoDouble(sym, SYMBOL_POINT);
+      bool   isBuy = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+      if(what == "stop loss" && slNow != 0.0)
+         return;
+      if(what == "breakeven" && slNow != 0.0 && (isBuy ? sl <= slNow + pt / 2 : sl >= slNow - pt / 2))
+         return;
+     }
    if(trade.PositionModify(ticket, sl, tpNow))
+     {
       PrintFormat("NewsGuard: #%I64u %s %s -> %s", ticket, sym, what, DoubleToString(sl, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)));
+      // TradeBot's automatic levels may replace this fixed stop: tell it which stop is NewsGuard's
+      if(what == "stop loss")
+         GlobalVariableSet("NG_S_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_" + IntegerToString((long)ticket), sl);
+     }
    else
       ErrPrint(ticket, sym, what);
   }
@@ -210,7 +224,8 @@ void Manage()
          if(valid)
             Modify(ticket, sym, s, tp, "stop loss");
          else
-            if(InpCloseIfPastSL && -profit >= slDist && CanTry(ticket))
+            if(InpCloseIfPastSL && -profit >= slDist && CanTry(ticket) &&
+               PositionSelectByTicket(ticket) && PositionGetDouble(POSITION_SL) == 0.0)   // still no stop (another tool may have set one)
               {
                if(trade.PositionClose(ticket))
                   PrintFormat("NewsGuard: #%I64u %s closed, already past the %.0f-pip stop", ticket, sym, InpSLPips);
