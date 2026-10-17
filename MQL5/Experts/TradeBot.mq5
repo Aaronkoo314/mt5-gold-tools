@@ -1,5 +1,5 @@
 ﻿//+------------------------------------------------------------------+
-//| TradeBot.mq5  (v1.43)                                            |
+//| TradeBot.mq5  (v1.44)                                            |
 //| Telegram trade-management bot for the open positions of one      |
 //| symbol (default: this chart's) on a hedging account. Buttons in  |
 //| your private Telegram chat: breakeven, close 25/50/75 %, derisk, |
@@ -46,7 +46,7 @@
 //|    connection longer than InpMaxCmdAgeS or that Telegram says    |
 //|    are too old, forwarded signals older than SIG_MAX_POST_MIN    |
 //+------------------------------------------------------------------+
-#property version     "1.43"
+#property version     "1.44"
 #property description "Telegram buttons: breakeven, close 25/50/75%, derisk, close all, levels.csv, status"
 
 #include <Trade\Trade.mqh>
@@ -923,7 +923,11 @@ bool LvLoad(LvConfig &c, string &err)
    ResetLastError();
    int h = FileOpen("levels.csv", FILE_READ | FILE_TXT | FILE_ANSI | FILE_SHARE_READ | FILE_SHARE_WRITE);
    if(h == INVALID_HANDLE)
-     { err = StringFormat("打不开 MQL5/Files/levels.csv（错误 %d）", GetLastError()); return(false); }
+     {
+      err = FileIsExist("levels.csv") ? StringFormat("打不开 MQL5/Files/levels.csv（错误 %d）", GetLastError())
+                                        : "这台电脑上还没有 levels.csv：把喊单转发给我就会写好（开了自动 levels，进场后会自动设，不用按这个按钮）";
+      return(false);
+     }
    int seen = 0;
    while(!FileIsEnding(h))
      {
