@@ -1,6 +1,6 @@
 # 常开电脑安装说明
 
-这台电脑一直开着 MT5，挂 **TradeBot**（NewsGuard 可以不挂）。你在手机上下的单，由 TradeBot 按你的第一笔进场自动设 SL / TP；Telegram 按钮也由它执行。
+这台电脑一直开着 MT5，挂 **TradeBot**（NewsGuard 可以不挂）。你在手机上下单后，在 Telegram 点「套用 levels」，TradeBot 按你的第一笔进场算 SL / TP，你确认后设好；其他 Telegram 按钮也由它执行。
 
 **规则：同一个 EA 只挂在一台电脑上。** NewsGuard 和 TradeBot 只挂在这台，原来那台电脑上要移除。脚本（ApplyLevels、BreakEven、CloseAll、GamePlanZones）两台都可以用。
 
@@ -66,14 +66,14 @@
 
 1. 在手机上下 1 张 0.01 手。几秒内 NewsGuard 应该加上止损（「工具箱 → 智能交易系统」日志里有 `stop loss ->`）。
 2. 在 Telegram 点「状态」，应该有回复。再试「保本」「平 50%」「全平」（要点确认）。
-3. 下 1 张 0.01 手：几秒内收到「自动设好 levels：按第一笔 …… 算」，SL 在第一笔外 $10，TP 在 +4 / +9 / +14。
+3. 下 1 张 0.01 手，点「套用 levels」：先收到预览「按第一笔 …… 算」：SL 在第一笔亏损那边 $10；只有 1 张时 TP 设在盈利那边 $9（TP2），张数多了才分 $4 / $9 / $14。点「确认」后收到「已套用 levels」，MT5 里这张单的 SL / TP 和预览一样。
 
 ## 平时怎么用
 
-- **下单就行**：几秒内机器人按你这组的第一笔自动设 SL / TP（规则见 README「自动 levels」），Telegram 会告诉你止损金额。
+- **下单后点「套用 levels」 → 看预览 → 点「确认」**：按你这组的第一笔设 SL / TP（规则见 README「套用 levels」）。加了单再点一次。
 - **保本、平 25/50/75%、减仓、全平**：用 Telegram 按钮。
 - **转发喊单**（可选）：转发了就按喊单的真实数字设。
-- **levels.csv 和 gameplan.csv 每台电脑各有一份。** 自动 levels 用的是这台电脑上的文件，所以喊单和 GP 都要转发给机器人。原来那台电脑上的 Alt+L 只读原来那台的文件。
+- **levels.csv 和 gameplan.csv 每台电脑各有一份。** 机器人用的是这台电脑上的文件，所以喊单要转发给机器人。原来那台电脑上的 Alt+L 只读原来那台的文件。
 - **不要往 NewsGuard 那张图上拖别的 EA 或模板**，会把它换掉。10/14 和 10/15 两次，NewsGuard 都在 CloseAll 运行前几秒被移除，原因待查。
 
 ## 安全
