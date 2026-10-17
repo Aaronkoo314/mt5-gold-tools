@@ -1,5 +1,5 @@
 ﻿//+------------------------------------------------------------------+
-//| TradeBot.mq5  (v1.44)                                            |
+//| TradeBot.mq5  (v1.53)                                            |
 //| Telegram trade-management bot for the open positions of one      |
 //| symbol (default: this chart's) on a hedging account. Buttons in  |
 //| your private Telegram chat: breakeven, close 25/50/75 %, derisk, |
@@ -37,7 +37,7 @@
 //|    levels.csv; a gameplan post is written to gameplan.csv; a     |
 //|    forwarded message is only ever read as a signal or gameplan,  |
 //|    never as a command                                            |
-//|  - automatic levels (InpAutoLevels, v1.43): positions inside the |
+//|  - automatic levels (InpAutoLevels, v1.53): positions inside the |
 //|    signal zone or a GP zone get SL / TP1-3 without a tap (see    |
 //|    "automatic levels" below); positions outside every zone are   |
 //|    not touched                                                   |
@@ -46,7 +46,7 @@
 //|    connection longer than InpMaxCmdAgeS or that Telegram says    |
 //|    are too old, forwarded signals older than SIG_MAX_POST_MIN    |
 //+------------------------------------------------------------------+
-#property version     "1.44"
+#property version     "1.53"
 #property description "Telegram buttons: breakeven, close 25/50/75%, derisk, close all, levels.csv, status"
 
 #include <Trade\Trade.mqh>
@@ -68,10 +68,13 @@ input double InpTP3        = 14.0;  // GP zone: TP3 from the small zone's near e
 input int    InpAutoSigMin = 120;   // A forwarded or pasted signal is used for this many minutes
 input int    InpGpMaxDays  = 4;     // Use gameplan.csv only while it is at most this many days old
 input double InpAutoWarnPct = 20;   // Warn when the loss at all stops is above this % of balance
+input bool   InpOrderLevels = true;  // Other positions: levels from the group's first entry (his 5-wide zone, SL $10, TP +4/+9/+14)
+input bool   InpUseGp       = false; // Also use gameplan.csv zones (GP posts forwarded to the bot)
+input bool   InpWithNewsGuard = false; // NewsGuard runs on this account: let it set its first stop and breakeven first
 
 #define TG_URL  "https://api.telegram.org/bot"
 #define MAGIC   261009
-#define LONGPOLL 5                  // seconds Telegram may hold a getUpdates request open (also the longest wait for automatic levels)
+#define LONGPOLL 2                  // seconds Telegram may hold a getUpdates request open (also the longest wait for automatic levels)
 
 string   g_sym = "";
 string   g_token = "";             // InpBotToken without spaces, quotes or a leading "bot"
@@ -424,7 +427,7 @@ string ConfirmKb(const string cmd)
   }
 
 // kb: "" = no buttons, "menu", or "confirm:<cmd>". A message with buttons makes all older buttons stale.
-bool TgSend(const long chat, const string text, const string kb)
+bool TgSend(const long chat, const string text, const string kb, const int timeoutMs = 10000)
   {
    string t = text;
    if(StringLen(t) > 3900)
@@ -437,14 +440,14 @@ bool TgSend(const long chat, const string text, const string kb)
      }
    body += "}";
    string resp;
-   int code = TgCall("sendMessage", body, resp, 10000);
+   int code = TgCall("sendMessage", body, resp, timeoutMs);
    if(code == 429)
      {
       int wait = (int)StringToInteger(JVal(resp, "retry_after", 0));
       if(wait >= 0 && wait <= 5)
         {
          Sleep(wait * 1000 + 200);
-         code = TgCall("sendMessage", body, resp, 10000);
+         code = TgCall("sendMessage", body, resp, timeoutMs);
         }
      }
    if(kb != "")
@@ -1671,6 +1674,13 @@ struct AZone
 ulong    g_outSeen[];  // positions already reported as outside every zone
 string   g_autoKey[];  // last message per group, so the same note is not sent again
 string   g_autoMsg[];
+datetime g_noStopWarn = 0;
+string   g_noteLate = "";   // automatic notes that did not reach Telegram
+datetime g_noteRetryAt = 0;
+string   g_noteKey[];  // automatic notes waiting to be sent: one per group, sent 8 s after its last change
+string   g_noteMsg[];
+datetime g_noteTime[];
+bool     g_noteUrgent[];
 ulong    g_failTk[];   // positions whose last modification failed, and when to try again
 datetime g_failUntil[];
 
@@ -1736,6 +1746,8 @@ int LoadZones(AZone &z[], string &info)
                           TimeToString(c.created + InpAutoSigMin * 60, TIME_MINUTES));
       n++;
      }
+   if(!InpUseGp)
+      return(n);
    int h = FileOpen("gameplan.csv", FILE_READ | FILE_TXT | FILE_ANSI | FILE_SHARE_READ | FILE_SHARE_WRITE);
    if(h == INVALID_HANDLE)
       return(n);
@@ -1876,19 +1888,27 @@ bool FailPaused(const ulong t)
    return(false);
   }
 
-void FailMark(const ulong t)
+int FailCount(const ulong t)
+  {
+   string k = TicketVar(t, "n");
+   double c = GlobalVariableCheck(k) ? GlobalVariableGet(k) + 1 : 1;
+   GlobalVariableSet(k, c);
+   return((int)c - 1);
+  }
+
+void FailMark(const ulong t, const int secs)
   {
    for(int i = 0; i < ArraySize(g_failTk); i++)
       if(g_failTk[i] == t)
         {
-         g_failUntil[i] = TimeLocal() + 30;
+         g_failUntil[i] = TimeLocal() + secs;
          return;
         }
    int q = ArraySize(g_failTk);
    ArrayResize(g_failTk, q + 1);
    ArrayResize(g_failUntil, q + 1);
    g_failTk[q] = t;
-   g_failUntil[q] = TimeLocal() + 30;
+   g_failUntil[q] = TimeLocal() + secs;
   }
 
 // which levels a position follows: 1e10 + zone for a signal, 2e10 + zone for a GP zone
@@ -1934,7 +1954,7 @@ string AutoApplyGroup(const AZone &zz, const bool isBuy, Pos &mem[], const int m
      }
    else
      {
-      if(shi - slo > InpSubWidth)
+      if(shi - slo > InpSubWidth + 0.001)
         {
          bool lowEdge = MathAbs(anchor - zz.lo) <= MathAbs(anchor - zz.hi);
          if(lowEdge) shi = slo + InpSubWidth;
@@ -1978,11 +1998,11 @@ string AutoApplyGroup(const AZone &zz, const bool isBuy, Pos &mem[], const int m
       bool isNg = IsNewsGuardStop(mem[i].tk, cur);
       if(!hasS && !hasT)
         {
-         if(cur == 0.0 && ageS < 5)
+         if(InpWithNewsGuard && cur == 0.0 && ageS < 5)
            { skip[i] = true; continue; }                   // NewsGuard adds its stop first
-         if(ageS > 60)
+         if(ageS > 60 || !InpWithNewsGuard)
            {
-            // an older position: a stop / TP it already has was set by you or another tool - keep it
+            // an older position (or any position when NewsGuard is not used): a stop / TP it already has was set by you or another tool - keep it
             // (NewsGuard's fixed stop is only a placeholder and may be replaced at any age)
             if(cur != 0.0 && !isNg) { GlobalVariableSet(ks, -1); hasS = true; }
             if(curTp != 0.0)        { GlobalVariableSet(kt, -1); hasT = true; }
@@ -2001,7 +2021,7 @@ string AutoApplyGroup(const AZone &zz, const bool isBuy, Pos &mem[], const int m
          reRank = true;
         }
       // NewsGuard's first stop landed just after ours and wiped our TP: set both again
-      if(hasT && GlobalVariableGet(kt) > 0 && curTp == 0.0 && (isNg || ageS <= 60) && !GlobalVariableCheck(TicketVar(mem[i].tk, "r")))
+      if(InpWithNewsGuard && hasT && GlobalVariableGet(kt) > 0 && curTp == 0.0 && (isNg || ageS <= 60) && !GlobalVariableCheck(TicketVar(mem[i].tk, "r")))
         {
          repair[i] = true;
          GlobalVariableSet(TicketVar(mem[i].tk, "r"), 1);
@@ -2017,7 +2037,7 @@ string AutoApplyGroup(const AZone &zz, const bool isBuy, Pos &mem[], const int m
    int n1 = (int)MathRound(0.25 * m);
    int n2 = (int)MathRound(0.70 * m) - n1;
    if(n1 + n2 > m) n2 = m - n1;
-   int changed = 0, failed = 0, slSkipped = 0, kept = 0, handled = 0, reSig = 0, slTighterKept = 0, beWait = 0;
+   int changed = 0, failed = 0, slSkipped = 0, kept = 0, handled = 0, reSig = 0, slTighterKept = 0, beWait = 0, fallback = 0, noStop = 0;
    int cnt[4] = {0, 0, 0, 0};
    double lots = 0, risk = 0;
    string lastErr = "";
@@ -2044,7 +2064,18 @@ string AutoApplyGroup(const AZone &zz, const bool isBuy, Pos &mem[], const int m
         {
          bool tighter = (cur == 0.0) || (isBuy ? sl > cur + pt / 2 : sl < cur - pt / 2);
          if(!slOk)
-            slSkipped++;
+           {
+            if(cur == 0.0)
+              {
+               double fb = NormalizeDouble(isBuy ? op - (InpSubWidth + InpSubSL) : op + (InpSubWidth + InpSubSL), dg);
+               if(isBuy ? (t.bid - fb >= minD) : (fb - t.ask >= minD))
+                 { newSl = fb; fallback++; GlobalVariableSet(TicketVar(mem[i].tk, "f"), fb); }
+               else
+                  noStop++;
+              }
+            else if(!(GlobalVariableCheck(TicketVar(mem[i].tk, "f")) && MathAbs(GlobalVariableGet(TicketVar(mem[i].tk, "f")) - cur) < pt / 2))
+               slSkipped++;
+           }
          else if(firstS || tighter)
             newSl = sl;
          else if(MathAbs(sl - cur) >= pt / 2)
@@ -2058,7 +2089,7 @@ string AutoApplyGroup(const AZone &zz, const bool isBuy, Pos &mem[], const int m
          newTp = tp[k];
       // a position about to be moved to breakeven by NewsGuard (+$4) is left to it first (both would change it at once)
       double prof = isBuy ? t.bid - op : op - t.ask;
-      if(!lockIn && !firstS && prof >= 3.5 && (MathAbs(newSl - cur) >= pt / 2 || MathAbs(newTp - curTp) >= pt / 2))
+      if(InpWithNewsGuard && !lockIn && !firstS && prof >= 3.5 && (MathAbs(newSl - cur) >= pt / 2 || MathAbs(newTp - curTp) >= pt / 2))
         {
          GlobalVariableSet(TicketVar(mem[i].tk, "p"), 1);
          beWait++;
@@ -2079,7 +2110,9 @@ string AutoApplyGroup(const AZone &zz, const bool isBuy, Pos &mem[], const int m
            {
             failed++;
             lastErr = LastErr();
-            FailMark(mem[i].tk);
+            uint rc = trade.ResultRetcode();
+            bool closed = (rc == TRADE_RETCODE_MARKET_CLOSED || rc == TRADE_RETCODE_TRADE_DISABLED || rc == TRADE_RETCODE_SERVER_DISABLES_AT || rc == TRADE_RETCODE_CLIENT_DISABLES_AT);
+            FailMark(mem[i].tk, closed ? 60 : (cur == 0.0 ? (FailCount(mem[i].tk) < 3 ? 3 : 10) : 30));
             continue;
            }
          if(newSrc[i] && zz.sig && MathAbs(newSl - cur) >= pt / 2)
@@ -2115,7 +2148,7 @@ string AutoApplyGroup(const AZone &zz, const bool isBuy, Pos &mem[], const int m
       GlobalVariableSet(base + "t", (double)TimeCurrent());
       GlobalVariablesFlush();
      }
-   if(changed == 0 && failed == 0 && slSkipped == 0)
+   if(changed == 0 && failed == 0 && slSkipped == 0 && noStop == 0)
       return("");
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
    double pct = (bal > 0) ? risk / bal * 100.0 : 0;
@@ -2134,37 +2167,248 @@ string AutoApplyGroup(const AZone &zz, const bool isBuy, Pos &mem[], const int m
       s += StringFormat("\n%d 张已在保本或更好，止损没动。", kept);
    if(slSkipped > 0)
       s += StringFormat("\n注意：价格已经越过 SL %s，%d 张的止损没有改（保留原来的）。", Px(sl), slSkipped);
+   if(fallback > 0)
+      s += StringFormat("\n注意：价格已经越过 SL %s，%d 张先设了离进场 $%.0f 的止损；价格回来后再收紧到 %s。", Px(sl), fallback, InpSubWidth + InpSubSL, Px(sl));
+   if(noStop > 0)
+      s += StringFormat("\n⚠️ %d 张没有止损：价格已经越过 SL %s，离进场 $%.0f 的止损也设不了。请手动处理。", noStop, Px(sl), InpSubWidth + InpSubSL);
    if(failed > 0)
-      s += StringFormat("\n注意：%d 张没设成功（%s），30 秒后再试。", failed, lastErr);
+      s += StringFormat("\n注意：%d 张没设成功（%s），稍后再试。", failed, lastErr);
+   // the same note twice in a row (e.g. a stop that cannot be set yet) is not sent again,
+   // except the no-stop warning, which repeats every 60 s
+   string key = GroupVar(zz, isBuy);
+   bool urgent = false;
+   if(noStop > 0 && TimeLocal() - g_noStopWarn >= 60)
+     {
+      urgent = true;
+      g_noStopWarn = TimeLocal();
+     }
+   int q = -1;
+   for(int i = 0; i < ArraySize(g_autoKey) && q < 0; i++)
+      if(g_autoKey[i] == key)
+         q = i;
+   if(q >= 0 && changed == 0 && g_autoMsg[q] == s && !urgent)
+      return("");
+   bool firstNote = (q < 0);
+   if(q < 0)
+     {
+      q = ArraySize(g_autoKey);
+      ArrayResize(g_autoKey, q + 1);
+      ArrayResize(g_autoMsg, q + 1);
+      g_autoKey[q] = key;
+     }
+   g_autoMsg[q] = s;
    PrintFormat("TradeBot auto levels %s %s: changed %d, failed %d, SL skipped %d, SL %s, risk $%.0f %s", zz.name, isBuy ? "buy" : "sell",
                changed, failed, slSkipped, Px(sl), risk, lastErr);
-   // the same note twice in a row (e.g. a stop that cannot be set yet) is not sent again
-   string key = GroupVar(zz, isBuy);
-   for(int i = 0; i < ArraySize(g_autoKey); i++)
-      if(g_autoKey[i] == key)
-        {
-         if(changed == 0 && g_autoMsg[i] == s)
-            return("");
-         g_autoMsg[i] = s;
-         return(s);
-        }
-   int q = ArraySize(g_autoKey);
-   ArrayResize(g_autoKey, q + 1);
-   ArrayResize(g_autoMsg, q + 1);
-   g_autoKey[q] = key;
-   g_autoMsg[q] = s;
+   NoteQueue(key, s, urgent || firstNote || noStop > 0 || fallback > 0);
    return(s);
+  }
+
+string OrderPrefix() { return("TB_O_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_"); }
+
+// the zone of an order group: his 5-wide signal zone with the group's first entry as its near edge
+// (sell: first entry = lower edge; buy: first entry = upper edge)
+void OrderZone(const bool isBuy, const double anchor, AZone &gz)
+  {
+   gz.side = isBuy ? 1 : -1;
+   gz.lo = isBuy ? anchor - InpSubWidth : anchor;
+   gz.hi = isBuy ? anchor : anchor + InpSubWidth;
+   gz.sig = false;
+   gz.sl = 0;
+   for(int k = 0; k < 3; k++) gz.tp[k] = 0;
+   gz.created = 0;
+   gz.name = StringFormat("按第一笔 %s 算（区间 %s–%s）", Px(anchor), Px(gz.lo), Px(gz.hi));
+  }
+
+// Levels from your own orders: positions that are not in a forwarded signal's zone (and do not follow an
+// expired signal) are grouped by their first entry. A position stays in the group it was set in; a saved first
+// entry lives only while one of its positions is open; a new position joins the nearest live group whose zone
+// (+- InpAutoTol) contains it, else it starts a new group. First entries: TB_O_<login>_<B|S>_<price>_<ticket>.
+string OrderLevels(const AZone &z[], const Pos &ps[], const int n)
+  {
+   string msg = "";
+   for(int d = 0; d < 2; d++)
+     {
+      bool isBuy = (d == 0);
+      string pre = OrderPrefix() + (isBuy ? "B_" : "S_");
+      double anc[], key[];
+      string var[];
+      bool   live[];
+      int na = 0;
+      for(int g = 0; g < GlobalVariablesTotal(); g++)
+        {
+         string nm = GlobalVariableName(g);
+         if(StringFind(nm, pre) != 0)
+            continue;
+         ArrayResize(anc, na + 1); ArrayResize(key, na + 1); ArrayResize(var, na + 1); ArrayResize(live, na + 1);
+         anc[na] = GlobalVariableGet(nm);
+         var[na] = nm;
+         AZone t;
+         OrderZone(isBuy, anc[na], t);
+         key[na] = SourceKey(t);
+         live[na] = false;
+         na++;
+        }
+      // this side's positions outside a signal zone, oldest first
+      Pos un[];
+      int nu = 0;
+      for(int i = 0; i < n; i++)
+         if(ps[i].buy == isBuy && ZoneFor(z, isBuy, ps[i].op) < 0 && !SignalSourced(ps[i].tk))
+           {
+            ArrayResize(un, nu + 1);
+            un[nu++] = ps[i];
+           }
+      for(int i = 0; i < nu - 1; i++)
+         for(int j = i + 1; j < nu; j++)
+            if(un[j].tm < un[i].tm)
+              {
+               Pos x = un[i]; un[i] = un[j]; un[j] = x;
+              }
+      // 1. a position stays in the group it was set in
+      int grp[];
+      ArrayResize(grp, nu);
+      for(int i = 0; i < nu; i++)
+        {
+         grp[i] = -1;
+         string kz = TicketVar(un[i].tk, "z");
+         if(!GlobalVariableCheck(kz))
+            continue;
+         double v = GlobalVariableGet(kz);
+         for(int a2 = 0; a2 < na && grp[i] < 0; a2++)
+            if(MathAbs(v - key[a2]) < 0.5)
+              {
+               grp[i] = a2;
+               live[a2] = true;
+              }
+        }
+      // 2. a first entry without an open position of its group is forgotten
+      for(int a2 = 0; a2 < na; a2++)
+         if(!live[a2])
+            GlobalVariableDel(var[a2]);
+      // 3. new positions: the nearest live group zone, else a new group
+      for(int i = 0; i < nu; i++)
+        {
+         if(grp[i] >= 0)
+            continue;
+         int best = -1;
+         double bestD = 1e9;
+         for(int a2 = 0; a2 < na; a2++)
+           {
+            if(!live[a2])
+               continue;
+            double lo = isBuy ? anc[a2] - InpSubWidth : anc[a2], hi = isBuy ? anc[a2] : anc[a2] + InpSubWidth;
+            if(un[i].op < lo - InpAutoTol || un[i].op > hi + InpAutoTol)
+               continue;
+            double dd = (un[i].op >= lo && un[i].op <= hi) ? 0 : MathMin(MathAbs(un[i].op - lo), MathAbs(un[i].op - hi));
+            dd = dd * 1000 + MathAbs(un[i].op - anc[a2]);              // tie: the nearest first entry
+            if(dd < bestD)
+              {
+               bestD = dd;
+               best = a2;
+              }
+           }
+         if(best < 0)
+           {
+            ArrayResize(anc, na + 1); ArrayResize(key, na + 1); ArrayResize(var, na + 1); ArrayResize(live, na + 1);
+            anc[na] = un[i].op;
+            var[na] = pre + DoubleToString(un[i].op, 2) + "_" + IntegerToString((long)un[i].tk);
+            AZone t;
+            OrderZone(isBuy, anc[na], t);
+            key[na] = SourceKey(t);
+            live[na] = true;
+            GlobalVariableSet(var[na], anc[na]);
+            best = na++;
+           }
+         grp[i] = best;
+        }
+      for(int a2 = 0; a2 < na; a2++)
+        {
+         if(!live[a2])
+            continue;
+         Pos mem[];
+         int m = 0;
+         for(int i = 0; i < nu; i++)
+            if(grp[i] == a2)
+              {
+               ArrayResize(mem, m + 1);
+               mem[m++] = un[i];
+              }
+         if(m == 0)
+            continue;
+         AZone gz;
+         OrderZone(isBuy, anc[a2], gz);
+         string s2 = AutoApplyGroup(gz, isBuy, mem, m, anc[a2]);
+         if(s2 != "")
+            msg += (msg == "" ? "" : "\n\n") + s2;
+        }
+     }
+   return(msg);
+  }
+
+// queue an automatic note (one per key; a newer note replaces the older one)
+void NoteQueue(const string key, const string text, const bool urgent)
+  {
+   for(int i = 0; i < ArraySize(g_noteKey); i++)
+      if(g_noteKey[i] == key)
+        {
+         g_noteMsg[i] = text;
+         g_noteTime[i] = TimeLocal();
+         g_noteUrgent[i] = g_noteUrgent[i] || urgent;
+         return;
+        }
+   int q = ArraySize(g_noteKey);
+   ArrayResize(g_noteKey, q + 1); ArrayResize(g_noteMsg, q + 1); ArrayResize(g_noteTime, q + 1); ArrayResize(g_noteUrgent, q + 1);
+   g_noteKey[q] = key;
+   g_noteMsg[q] = text;
+   g_noteTime[q] = TimeLocal();
+   g_noteUrgent[q] = urgent;
+  }
+
+// send the notes whose group did not change for 8 s (urgent ones at once), in one message without buttons,
+// with a short timeout so a slow Telegram does not hold up the automatic levels
+void NoteFlush()
+  {
+   string out = "";
+   for(int i = ArraySize(g_noteKey) - 1; i >= 0; i--)
+     {
+      if(!g_noteUrgent[i] && TimeLocal() - g_noteTime[i] < 8)
+         continue;
+      out = g_noteMsg[i] + (out == "" ? "" : "\n\n" + out);
+      int last = ArraySize(g_noteKey) - 1;
+      g_noteKey[i] = g_noteKey[last]; g_noteMsg[i] = g_noteMsg[last]; g_noteTime[i] = g_noteTime[last]; g_noteUrgent[i] = g_noteUrgent[last];
+      ArrayResize(g_noteKey, last); ArrayResize(g_noteMsg, last); ArrayResize(g_noteTime, last); ArrayResize(g_noteUrgent, last);
+     }
+   if(g_token == "" || InpChatId == 0)
+      return;
+   bool retry = (g_noteLate != "" && TimeLocal() >= g_noteRetryAt);
+   string body = retry ? g_noteLate + (out == "" ? "" : "\n\n" + out) : out;
+   if(body == "")
+      return;
+   if(TgSend(InpChatId, (retry ? "之前没送到的通知：\n" : "") + body, "", 3000))
+     {
+      if(retry)
+         g_noteLate = "";
+     }
+   else
+     {
+      g_noteLate = retry ? body : g_noteLate + (g_noteLate == "" || out == "" ? "" : "\n\n") + out;
+      if(StringLen(g_noteLate) > 3000)
+         g_noteLate = StringSubstr(g_noteLate, StringLen(g_noteLate) - 3000);   // keep the newest
+      g_noteRetryAt = TimeLocal() + 30;
+     }
   }
 
 void AutoLevels()
   {
-   if(!InpAutoLevels)
+   if(!InpAutoLevels || !TerminalInfoInteger(TERMINAL_CONNECTED))
       return;
    if(StringFind(g_sym, "XAU") != 0 && StringFind(g_sym, "GOLD") < 0)
       return;
    AZone z[];
    string info;
    int nz = LoadZones(z, info);
+   if(InpOrderLevels)
+      info += (info == "" ? "" : "；") + StringFormat("其他单按每组第一笔算（SL 离第一笔 $%.0f，TP +%.0f / +%.0f / +%.0f）",
+                                                     InpSubWidth + InpSubSL, InpTP1, InpTP2, InpTP3);
    g_autoInfo = info;
    Pos ps[];
    int n = Collect(ps);
@@ -2172,6 +2416,10 @@ void AutoLevels()
    if(n == 0)
      {
       ArrayResize(g_outSeen, 0);
+      string pre = OrderPrefix();                         // no position open: no order group
+      for(int g = GlobalVariablesTotal() - 1; g >= 0; g--)
+         if(StringFind(GlobalVariableName(g), pre) == 0)
+            GlobalVariableDel(GlobalVariableName(g));
       return;
      }
    string msg = "";
@@ -2180,7 +2428,7 @@ void AutoLevels()
    double oLo = 0, oHi = 0;
    for(int i = 0; i < n; i++)
      {
-      if(ZoneFor(z, ps[i].buy, ps[i].op) >= 0 || GlobalVariableCheck(TicketVar(ps[i].tk, "z")))
+      if(InpOrderLevels || ZoneFor(z, ps[i].buy, ps[i].op) >= 0 || GlobalVariableCheck(TicketVar(ps[i].tk, "z")))
          continue;                                         // in a zone, or levels were set here before
       bool seen = false;
       for(int q = 0; q < ArraySize(g_outSeen) && !seen; q++)
@@ -2197,7 +2445,7 @@ void AutoLevels()
    if(nOut > 0)
       msg += StringFormat("%d 张（进场价 %s–%s）不在任何区里，没有自动设 levels（NewsGuard 的固定止损照常）。%s", nOut, Px(oLo), Px(oHi),
                           nz == 0 ? "\n这台电脑上没有可用的喊单或 GP：早上把他的 GP 帖转发给我。" : "");
-   if(nz > 0)
+   if(nz > 0 || InpOrderLevels)
      {
       if(!TradingAllowed())
         {
@@ -2209,6 +2457,7 @@ void AutoLevels()
            }
         }
       else
+        {
          for(int k = 0; k < nz; k++)
             for(int d = 0; d < 2; d++)
               {
@@ -2243,17 +2492,16 @@ void AutoLevels()
                   anchor = firstOp;
                   GlobalVariableSet(gv, anchor);
                  }
-               string s = AutoApplyGroup(z[k], isBuy, mem, m, anchor);
-               if(s != "")
-                  msg += (msg == "" ? "" : "\n\n") + s;
+               AutoApplyGroup(z[k], isBuy, mem, m, anchor);        // queues its own note
               }
+         if(InpOrderLevels)
+           {
+            OrderLevels(z, ps, n);                                // each group queues its own note
+           }
+        }
      }
-   // notes go without buttons, so the menu you may be tapping stays valid
-   if(msg != "" && g_token != "" && InpChatId != 0 && !TgSend(InpChatId, msg, ""))
-     {
-      g_unsent += (g_unsent == "" ? "" : "\n\n") + msg;
-      g_unsentTries = 0;
-     }
+   if(msg != "")
+      NoteQueue("misc", msg, true);
   }
 
 //+------------------------------------------------------------------+
@@ -2486,6 +2734,7 @@ bool TryGameplan(const long chat, const string text, const long origin)
      }
    bool tooOld = TimeLocal() - newDay > InpGpMaxDays * 86400;
    TgSend(chat, StringFormat("已记下 %s 的 GP（%s），gameplan.csv 已更新：%s\n\n%s", day, tf == "" ? "?" : tf, list,
+                             !InpUseGp ? "GP 模式关着（InpUseGp）：这份 GP 只用来画图（拖一次 GamePlanZones），自动 levels 按你每组的第一笔算。" :
                              tooOld ? StringFormat("注意：这份 GP 已经超过 %d 天，自动 levels 不会用它。", InpGpMaxDays)
                                     : StringFormat("在这些区里（±$%.0f）进场的单会自动设 SL / TP。要在图上画出来，拖一次 GamePlanZones。", InpAutoTol)), GpKb());
    AutoLevels();
@@ -2690,7 +2939,7 @@ void Poll()
    string method = g_primed ? StringFormat("getUpdates?offset=%I64d&timeout=%d", g_offset, LONGPOLL)
                             : "getUpdates?offset=-1&timeout=0";
    method += "&allowed_updates=%5B%22message%22,%22callback_query%22%5D";
-   int code = TgCall(method, "", resp, g_primed ? (LONGPOLL + 5) * 1000 : 5000);
+   int code = TgCall(method, "", resp, g_primed ? (LONGPOLL + 3) * 1000 : 5000);
    if(IsStopped())
       return;                                        // the EA is being removed: handle nothing
    g_pollKb = false;
@@ -2796,14 +3045,15 @@ void Poll()
       g_primed = true;
       if(InpChatId != 0)
          TgSend(InpChatId, "TradeBot 已启动：" + g_sym + "，账户 " + Acct() + "。" +
-                (InpAutoLevels ? "\n自动 levels 开着：把他的 GP 帖和喊单转发给我，在区里进场的单会自动设 SL / TP。" : ""), "menu");
+                (InpAutoLevels ? (InpOrderLevels ? "\n自动 levels 开着：下单后几秒内，按每组第一笔进场自动设 SL / TP（转发喊单的话按喊单的数字）。"
+                                                  : "\n自动 levels 开着：把他的 GP 帖和喊单转发给我，在区里进场的单会自动设 SL / TP。") : ""), "menu");
      }
    if(g_unsent != "" && InpChatId != 0)
      {
       // no new buttons when this poll already sent some or a confirm is waiting (they would go stale)
       string kb = (g_pollKb || g_pending != "") ? "" : "menu";
       g_unsentTries++;
-      if(TgSend(InpChatId, "之前没送到的结果：\n" + g_unsent, kb) || g_unsentTries >= 3)
+      if(TgSend(InpChatId, "之前没送到的结果：\n" + g_unsent, kb, 3000) || g_unsentTries >= 3)
         {
          g_unsent = "";
          g_unsentTries = 0;
@@ -2882,5 +3132,7 @@ void OnTimer()
    Poll();
    if(!IsStopped())
       AutoLevels();
+   if(!IsStopped())
+      NoteFlush();
   }
 //+------------------------------------------------------------------+
