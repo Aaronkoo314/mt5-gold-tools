@@ -5,12 +5,13 @@
 //| file and running again redraws the plan.                         |
 //| Line format: kind;low;high;label;tooltip  (high = 0 -> line)     |
 //+------------------------------------------------------------------+
-#property version     "1.00"
+#property version     "1.10"
 #property description "Draw the gameplan zones from MQL5/Files/gameplan.csv (replaces earlier GP_ objects)."
 
 input string InpFile        = "gameplan.csv"; // File in MQL5\Files
 input int    InpDaysBack    = 7;              // Zones start this many days back
 input int    InpDaysForward = 5;              // Zones extend this many days forward
+input int    InpLabelBarsLeft = 0;            // Labels end this many bars left of the last bar
 
 void Colors(const string kind, color &fill, color &text)
   {
@@ -28,7 +29,7 @@ void Label(const string name, const datetime t, const double price, const string
    ObjectSetString(0, name, OBJPROP_FONT, "Arial");
    ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 8);
    ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
-   ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT_LOWER);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_RIGHT_LOWER);   // the text runs left from t, so it stays on screen
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
   }
 
@@ -45,7 +46,9 @@ void OnStart()
    datetime now = TimeCurrent();
    datetime t1  = now - (datetime)InpDaysBack * 86400;
    datetime t2  = now + (datetime)InpDaysForward * 86400;
-   datetime tl  = now + (datetime)PeriodSeconds() * 3;   // labels sit just right of the last bar
+   datetime tl  = iTime(_Symbol, _Period, MathMax(InpLabelBarsLeft, 0));   // labels end at the last bar (or further left)
+   if(tl == 0)
+      tl = now;
    int n = 0;
 
    while(!FileIsEnding(h))
