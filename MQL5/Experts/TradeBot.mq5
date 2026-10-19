@@ -1,5 +1,5 @@
 ﻿//+------------------------------------------------------------------+
-//| TradeBot.mq5  (v1.60)                                            |
+//| TradeBot.mq5  (v1.62)                                            |
 //| Telegram trade-management bot for the open positions of one      |
 //| symbol (default: this chart's) on a hedging account. Buttons in  |
 //| your private Telegram chat: breakeven, close 25/50/75 %, derisk, |
@@ -45,7 +45,7 @@
 //|    connection longer than InpMaxCmdAgeS or that Telegram says    |
 //|    are too old, forwarded signals older than SIG_MAX_POST_MIN    |
 //+------------------------------------------------------------------+
-#property version     "1.60"
+#property version     "1.62"
 #property description "Telegram buttons: breakeven, close 25/50/75%, derisk, close all, levels.csv, status"
 
 #include <Trade\Trade.mqh>
@@ -561,7 +561,7 @@ string DoStatus()
    if(InpAutoLevels)
       s += "\n自动 levels：" + (g_autoInfo == "" ? "没有可用的喊单或 GP（把 GP 帖或喊单转发给我）" : g_autoInfo);
    else if(InpOrderLevels)
-      s += StringFormat("\nlevels：点「套用 levels」时按每组第一笔算（SL 离第一笔 $%.0f，TP 离第一笔 $%.0f / $%.0f / $%.0f）",
+      s += StringFormat("\nlevels：点「套用 levels」时按现在开着的单、每组第一笔算（SL 离第一笔 $%.0f，TP 离第一笔 $%.0f / $%.0f / $%.0f）",
                         InpSubWidth + InpSubSL, InpTP1, InpTP2, InpTP3);
    int po = PendingOrders();
    if(po > 0)
@@ -1215,7 +1215,7 @@ void AskConfirm(const long chat, const string cmd)
       string pv = LevelsNow(true);
       if(g_plan == "")
         { TgSend(chat, "套用 levels：" + pv, "menu"); return; }
-      t = StringFormat("套用 levels（按你每组的第一笔算：SL 离第一笔 $%.0f，TP 离第一笔 $%.0f / $%.0f / $%.0f；转发过的喊单按喊单的数字）会设成：\n\n",
+      t = StringFormat("套用 levels（只算现在开着的单，平掉的不算；每组最早的一张当第一笔：SL 离第一笔 $%.0f，TP 离第一笔 $%.0f / $%.0f / $%.0f；有效期内转发过的喊单按喊单的数字）会设成：\n\n",
                        InpSubWidth + InpSubSL, InpTP1, InpTP2, InpTP3)
           + pv + StringFormat("\n\n已经保本的止损不动。%d 秒内点确认。", InpConfirmS);
       fp = "order|" + g_plan;
@@ -2316,10 +2316,12 @@ void OrderZone(const bool isBuy, const double anchor, AZone &gz)
    gz.name = StringFormat("按第一笔 %s 算（区间 %s–%s）", Px(anchor), Px(gz.lo), Px(gz.hi));
   }
 
-// Levels from your own orders: positions that are not in a forwarded signal's zone (and do not follow an
-// expired signal) are grouped by their first entry. A position stays in the group it was set in; a saved first
-// entry lives only while one of its positions is open; a new position joins the nearest live group whose zone
-// (+- InpAutoTol) contains it, else it starts a new group. First entries: TB_O_<login>_<B|S>_<price>_<ticket>.
+// Levels from your own orders: positions that are not in a forwarded signal's zone are grouped by their first
+// entry. 套用 levels (g_force) looks only at the positions open now: the oldest open position starts a group, the
+// next ones join the nearest group whose zone (+- InpAutoTol) contains them, else they start a new group; closed
+// positions and the saved first entries do not count (the saved ones are replaced). Automatic mode keeps the
+// groups: a position stays in the group it was set in, a saved first entry lives while one of its positions is
+// open, and positions that follow an expired signal are left alone. First entries: TB_O_<login>_<B|S>_<price>_<ticket>.
 string OrderLevels(const AZone &z[], const Pos &ps[], const int n)
   {
    string msg = "";
@@ -2331,7 +2333,11 @@ string OrderLevels(const AZone &z[], const Pos &ps[], const int n)
       string var[];
       bool   live[];
       int na = 0;
-      for(int g = 0; g < GlobalVariablesTotal(); g++)
+      if(g_force && !g_dry)
+         for(int g = GlobalVariablesTotal() - 1; g >= 0; g--)
+            if(StringFind(GlobalVariableName(g), pre) == 0)
+               GlobalVariableDel(GlobalVariableName(g));     // replaced by the groups of the positions open now
+      for(int g = 0; g < GlobalVariablesTotal() && !g_force; g++)
         {
          string nm = GlobalVariableName(g);
          if(StringFind(nm, pre) != 0)
@@ -2349,7 +2355,7 @@ string OrderLevels(const AZone &z[], const Pos &ps[], const int n)
       Pos un[];
       int nu = 0;
       for(int i = 0; i < n; i++)
-         if(ps[i].buy == isBuy && ZoneFor(z, isBuy, ps[i].op) < 0 && !SignalSourced(ps[i].tk))
+         if(ps[i].buy == isBuy && ZoneFor(z, isBuy, ps[i].op) < 0 && (g_force || !SignalSourced(ps[i].tk)))
            {
             ArrayResize(un, nu + 1);
             un[nu++] = ps[i];
@@ -2537,19 +2543,6 @@ void AutoLevels()
       return;
      }
    string msg = "";
-   if(g_force)
-     {
-      // positions set by a signal that has expired keep its levels (neither the zone groups nor the order groups take them)
-      int nOld = 0;
-      for(int i = 0; i < n; i++)
-        {
-         int zk = ZoneFor(z, ps[i].buy, ps[i].op);
-         if(SignalSourced(ps[i].tk) && (zk < 0 || !z[zk].sig))
-            nOld++;
-        }
-      if(nOld > 0)
-         msg = StringFormat("%d 张之前按喊单设过（喊单已过期或被新喊单替换），这次没动。", nOld);
-     }
    // positions outside every zone: one note each
    int nOut = 0;
    double oLo = 0, oHi = 0;
@@ -2598,8 +2591,8 @@ void AutoLevels()
                long firstTm = 0;
                double firstOp = 0;
                for(int i = 0; i < n; i++)
-                  // after a signal expires, its positions keep the signal's levels (not regrouped into a GP zone)
-                  if(ps[i].buy == isBuy && ZoneFor(z, isBuy, ps[i].op) == k && (z[k].sig || !SignalSourced(ps[i].tk)))
+                  // automatic mode: after a signal expires, its positions keep the signal's levels (not regrouped into a GP zone)
+                  if(ps[i].buy == isBuy && ZoneFor(z, isBuy, ps[i].op) == k && (z[k].sig || g_force || !SignalSourced(ps[i].tk)))
                     {
                      ArrayResize(mem, m + 1);
                      mem[m++] = ps[i];
@@ -2620,7 +2613,7 @@ void AutoLevels()
                   string kz = TicketVar(mem[i].tk, "z");
                   alive = GlobalVariableCheck(kz) && MathAbs(GlobalVariableGet(kz) - sk) < 0.5;
                  }
-               if(alive && GlobalVariableCheck(gv))
+               if(!g_force && alive && GlobalVariableCheck(gv))   // 套用 levels: the oldest position open now
                   anchor = GlobalVariableGet(gv);
                else
                  {
