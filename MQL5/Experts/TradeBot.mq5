@@ -1,5 +1,5 @@
 ﻿//+------------------------------------------------------------------+
-//| TradeBot.mq5  (v1.62)                                            |
+//| TradeBot.mq5  (v1.63)                                            |
 //| Telegram trade-management bot for the open positions of one      |
 //| symbol (default: this chart's) on a hedging account. Buttons in  |
 //| your private Telegram chat: breakeven, close 25/50/75 %, derisk, |
@@ -30,7 +30,9 @@
 //|    entry) or a forwarded signal; shows the plan first; the       |
 //|    confirm applies only if the plan (each position's SL, TP and  |
 //|    lots) is still the same                                       |
-//|  - close all / derisk / levels need a second tap (confirm)       |
+//|  - 重置 levels: removes every SL and TP of the symbol's         |
+//|    positions, breakeven stops too (confirm first)                |
+//|  - close all / derisk / levels / 重置 levels need a confirm tap  |
 //|  - only the buttons of the newest bot message act; older buttons |
 //|    and a second tap on the same message do nothing               |
 //|  - a signal pasted or forwarded to the bot ("Gold sell zone      |
@@ -45,7 +47,7 @@
 //|    connection longer than InpMaxCmdAgeS or that Telegram says    |
 //|    are too old, forwarded signals older than SIG_MAX_POST_MIN    |
 //+------------------------------------------------------------------+
-#property version     "1.62"
+#property version     "1.63"
 #property description "Telegram buttons: breakeven, close 25/50/75%, derisk, close all, levels.csv, status"
 
 #include <Trade\Trade.mqh>
@@ -56,7 +58,7 @@ input string InpSymbol     = "";    // Symbol to manage ("" = this chart's symbo
 input double InpDeriskPct  = 50;    // Derisk: % of the volume to close (worst entries first), then breakeven
 input int    InpPollMs     = 500;   // Pause between two requests to Telegram (ms)
 input int    InpMaxCmdAgeS = 60;    // Ignore typed commands older than this; also the longest connection gap (seconds)
-input int    InpConfirmS   = 30;    // Close all / derisk / levels: confirm within this many seconds
+input int    InpConfirmS   = 30;    // Close all / derisk / levels / 重置 levels: confirm within this many seconds
 input bool   InpAutoLevels = false; // true = set SL / TP automatically after each entry; false = only when you tap 套用 levels
 input double InpAutoTol    = 3.0;   // Entries this far outside a zone still count ($)
 input double InpSubWidth   = 5.0;   // GP zone: his signal zone width, from the edge nearest the first entry ($)
@@ -420,7 +422,7 @@ string MenuKb()
           "[{\"text\":\"保本 BE\",\"callback_data\":\"be" + s + "\"},{\"text\":\"状态\",\"callback_data\":\"status" + s + "\"}],"
           "[{\"text\":\"平 25%\",\"callback_data\":\"p25" + s + "\"},{\"text\":\"平 50%\",\"callback_data\":\"p50" + s + "\"},{\"text\":\"平 75%\",\"callback_data\":\"p75" + s + "\"}],"
           "[{\"text\":\"减仓\",\"callback_data\":\"derisk" + s + "\"},{\"text\":\"全平\",\"callback_data\":\"closeall" + s + "\"}],"
-          "[{\"text\":\"套用 levels\",\"callback_data\":\"levels" + s + "\"}]]}");
+          "[{\"text\":\"套用 levels\",\"callback_data\":\"levels" + s + "\"},{\"text\":\"重置 levels\",\"callback_data\":\"unlevels" + s + "\"}]]}");
   }
 
 string ConfirmKb(const string cmd)
@@ -1098,7 +1100,10 @@ bool DoLevels(const bool apply, const string expectFp, string &txt, string &fp)
       if(MathAbs(newSl - cur) < pt / 2 && MathAbs(tp - curTp) < pt / 2)
         { unchanged++; applied[tpIdx[i]]++; if(lockIn) kept++; risk += LossAt(isBuy, sel[i].vol, sel[i].op, newSl); continue; }
       if(trade.PositionModify(sel[i].tk, newSl, tp) || trade.ResultRetcode() == TRADE_RETCODE_NO_CHANGES)
-        { ok++; applied[tpIdx[i]]++; if(lockIn) kept++; risk += LossAt(isBuy, sel[i].vol, sel[i].op, newSl); }
+        {
+         ok++; applied[tpIdx[i]]++; if(lockIn) kept++; risk += LossAt(isBuy, sel[i].vol, sel[i].op, newSl);
+         GlobalVariableDel(TicketVar(sel[i].tk, "u"));        // set again after 重置 levels
+        }
       else
         {
          failed++;
@@ -1130,12 +1135,101 @@ bool DoLevels(const bool apply, const string expectFp, string &txt, string &fp)
    return(failed == 0);
   }
 
+// 重置 levels: every SL (breakeven ones too) and every TP of this symbol's positions is removed. The positions
+// are then marked (TB_T_ _s / _t = -1 and _u = 1), so automatic mode leaves them alone, also after NewsGuard
+// adds a stop; 套用 levels sets them again and clears the mark. fp: the positions with their SL / TP / lots when the preview was made.
+// NewsGuard is attached to a chart of this terminal, is set to run here, or has set a stop on this account
+bool NewsGuardSeen()
+  {
+   if(InpWithNewsGuard)
+      return(true);
+   for(long id = ChartFirst(); id >= 0; id = ChartNext(id))
+      if(ChartGetString(id, CHART_EXPERT_NAME) == "NewsGuard")
+         return(true);
+   string pre = "NG_S_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_";
+   for(int g = GlobalVariablesTotal() - 1; g >= 0; g--)
+      if(StringFind(GlobalVariableName(g), pre) == 0)
+         return(true);
+   return(false);
+  }
+
+string UnlevelsFp(int &nTp, int &nSl, int &n)
+  {
+   int dg = (int)SymbolInfoInteger(g_sym, SYMBOL_DIGITS);
+   Pos ps[];
+   n = Collect(ps);
+   nTp = nSl = 0;
+   string f = "unl|";
+   for(int i = 0; i < n; i++)
+     {
+      if(!PositionSelectByTicket(ps[i].tk))
+         continue;
+      double sl = PositionGetDouble(POSITION_SL), tp = PositionGetDouble(POSITION_TP);
+      if(tp > 0) nTp++;
+      if(sl > 0) nSl++;
+      f += IntegerToString((long)ps[i].tk) + ":" + DoubleToString(sl, dg) + ":" + DoubleToString(tp, dg) + ":" +
+           DoubleToString(PositionGetDouble(POSITION_VOLUME), 2) + ";";
+     }
+   return(f);
+  }
+
+string DoUnlevels(const string fp)
+  {
+   int nTp, nSl, n;
+   if(UnlevelsFp(nTp, nSl, n) != fp)
+      return("预览之后持仓或 SL / TP 变了，没有改动。请重新按「重置 levels」。");
+   double pt = SymbolInfoDouble(g_sym, SYMBOL_POINT);
+   Pos ps[];
+   n = Collect(ps);
+   int done = 0, same = 0, failed = 0, noStop = 0;
+   string err = "";
+   for(int i = 0; i < n; i++)
+     {
+      if(!PositionSelectByTicket(ps[i].tk))
+         continue;
+      double sl = PositionGetDouble(POSITION_SL), tp = PositionGetDouble(POSITION_TP);
+      bool ok = true;
+      if(sl != 0.0 || tp != 0.0)
+        {
+         ok = trade.PositionModify(ps[i].tk, 0.0, 0.0) || trade.ResultRetcode() == TRADE_RETCODE_NO_CHANGES;
+         if(ok) done++;
+         else  { failed++; err = LastErr(); }
+        }
+      else
+         same++;
+      if(!ok)
+         continue;
+      // yours from now on: automatic mode does not set them again (_u also covers a stop NewsGuard adds)
+      GlobalVariableSet(TicketVar(ps[i].tk, "s"), -1);
+      GlobalVariableSet(TicketVar(ps[i].tk, "t"), -1);
+      GlobalVariableSet(TicketVar(ps[i].tk, "u"), 1);
+      noStop++;
+     }
+   // NewsGuard's TP1 breakeven groups of this symbol no longer have a TP (kept when a position could not be reset)
+   string base = "AL_G_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_" + g_sym;
+   for(int g = GlobalVariablesTotal() - 1; g >= 0 && failed == 0; g--)
+     {
+      string nm = GlobalVariableName(g);
+      if(StringFind(nm, base + "_B_") == 0 || StringFind(nm, base + "_S_") == 0)   // not XAUUSD.s etc.
+         GlobalVariableDel(nm);
+     }
+   GlobalVariablesFlush();
+   string r = (done == 0 && failed > 0) ? "没有重置成功，SL / TP 都还在。"
+              : StringFormat("已重置 levels：删掉了 %d 张的 SL / TP，%d 张本来就没有。", done, same);
+   if(noStop > 0)
+      r += StringFormat("\n⚠️ 现在 %d 张没有止损%s。", noStop, NewsGuardSeen() ? "（NewsGuard 在运行，会马上加回它的止损或保本）" : "");
+   if(failed > 0)
+      r += StringFormat("\n注意：%d 张没改成（%s），再按一次「重置 levels」。", failed, err);
+   PrintFormat("TradeBot unlevels: changed %d, unchanged %d, failed %d, no stop %d %s", done, same, failed, noStop, err);
+   return(r);
+  }
+
 //+------------------------------------------------------------------+
 //| commands                                                         |
 //+------------------------------------------------------------------+
 bool IsAction(const string cmd)
   {
-   return(cmd == "be" || cmd == "p25" || cmd == "p50" || cmd == "p75" || cmd == "derisk" || cmd == "closeall" || cmd == "levels");
+   return(cmd == "be" || cmd == "p25" || cmd == "p50" || cmd == "p75" || cmd == "derisk" || cmd == "closeall" || cmd == "levels" || cmd == "unlevels");
   }
 
 // fp: what the preview showed (levels: plan fingerprint; close all: position count)
@@ -1159,6 +1253,8 @@ string Run(const string cmd, const string fp)
       r = a + "\n" + DoBE();
      }
    else if(cmd == "closeall") r = DoCloseAll(fp == "" ? -1 : (int)StringToInteger(fp));
+   else if(cmd == "unlevels")
+      r = DoUnlevels(fp);
    else if(cmd == "levels" && StringFind(fp, "order|") == 0)
      {
       string pv = LevelsNow(true);                         // the plan now, made the same way as the preview
@@ -1210,6 +1306,21 @@ void AskConfirm(const long chat, const string cmd)
    else if(cmd == "derisk")
       t = StringFormat("减仓：每个方向平掉 %.0f%% 的手数（最差的进场先平），剩下的移到保本（还没浮盈的跳过）。\n%d 秒内点确认。\n\n%s",
                        InpDeriskPct, InpConfirmS, DoStatus());
+   else if(cmd == "unlevels")
+     {
+      int nTp, nSl, np;
+      fp = UnlevelsFp(nTp, nSl, np);
+      if(np == 0)
+        { TgSend(chat, "重置 levels：没有持仓。", "menu"); return; }
+      if(nTp == 0 && nSl == 0)
+        { TgSend(chat, StringFormat("重置 levels：%d 张单本来就没有 SL / TP。", np), "menu"); return; }
+      t = StringFormat("重置 levels（%s，%d 张）：删掉 %d 张的止损（保本的也删）和 %d 张的 TP。\n"
+                       "⚠️ 删掉后 %d 张单都没有止损。之后机器人不会自己再给这些单设 SL / TP，要再设就点「套用 levels」。",
+                       g_sym, np, nSl, nTp, np);
+      if(NewsGuardSeen())
+         t += "\n⚠️ NewsGuard 在运行：重置后它会马上把浮盈够它保本条件的单移回保本，其余的单加回它的固定止损，已经亏过那个距离的单会被它直接平掉。";
+      t += StringFormat("\n%d 秒内点确认。", InpConfirmS);
+     }
    else if(InpOrderLevels)
      {
       string pv = LevelsNow(true);
@@ -2021,7 +2132,7 @@ string AutoApplyGroup(const AZone &zz, const bool isBuy, Pos &mem[], const int m
    for(int i = 0; i < m; i++)
      {
       skip[i] = fresh[i] = repair[i] = newSrc[i] = false;
-      if(!PositionSelectByTicket(mem[i].tk) || (!g_force && FailPaused(mem[i].tk)))
+      if(!PositionSelectByTicket(mem[i].tk) || (!g_force && (FailPaused(mem[i].tk) || GlobalVariableCheck(TicketVar(mem[i].tk, "u")))))
         { skip[i] = true; continue; }
       double cur = PositionGetDouble(POSITION_SL), curTp = PositionGetDouble(POSITION_TP);
       long   ageS = (nowMsc - mem[i].tm) / 1000;
@@ -2197,6 +2308,7 @@ string AutoApplyGroup(const AZone &zz, const bool isBuy, Pos &mem[], const int m
          if(zz.sig)
             GlobalVariableSet(TicketVar(mem[i].tk, "c"), (double)zz.created);
          GlobalVariableDel(TicketVar(mem[i].tk, "p"));
+         GlobalVariableDel(TicketVar(mem[i].tk, "u"));       // 套用 levels after 重置 levels
         }
       if(MathAbs(newTp - tp[0]) < pt / 2) cnt[0]++;
       else if(MathAbs(newTp - tp[1]) < pt / 2) cnt[1]++;
@@ -3102,7 +3214,7 @@ void Handle(const long chat, const string raw, const string cbId, const bool sta
       Execute(chat, what, fp);
       return;
      }
-   if(cmd == "derisk" || cmd == "closeall" || cmd == "levels")
+   if(cmd == "derisk" || cmd == "closeall" || cmd == "levels" || cmd == "unlevels")
      {
       AskConfirm(chat, cmd);
       return;
